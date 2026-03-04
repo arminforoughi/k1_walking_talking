@@ -72,15 +72,90 @@ python3 gemini_robot_control.py eth0
 
 | Script | Description |
 |--------|-------------|
-| **gemini_robot_control.py** | Voice + vision robot control (main script) |
+| **server.py** | Remote server — runs YOLO + face + Gemini on your PC (recommended) |
+| **robot_client.py** | Thin client — runs on the robot, streams video, executes commands |
+| **gemini_robot_control.py** | All-in-one on-robot mode (original, slower) |
 | **gemini_live_camera.py** | Gemini Live camera stream (no robot control) |
-| **k1_follow_person.py** | Autonomous person following with MiDaS depth |
-| **camera_feed_detection.py** | Web-based YOLO detection viewer with depth |
-| **extract_low_confidence_objects.py** | Save low-confidence detections for review |
 
-## Gemini Robot Control (`gemini_robot_control.py`)
+## Remote Mode (Recommended)
 
-The main script — a fully voice-controlled robot powered by Gemini Live API with real-time vision.
+Offload all heavy computation (YOLO, face recognition, Gemini AI) to your PC/laptop. The robot runs a thin client that streams camera frames and executes commands. Much faster and more responsive.
+
+### Architecture
+
+```
+┌──────────────────────┐       WebSocket (ws://IP:9090)       ┌──────────────────────┐
+│   ROBOT (K1)         │ ◄═══════════════════════════════════► │   YOUR MACHINE       │
+│   robot_client.py    │                                       │   server.py          │
+│                      │  Robot → Server:                      │                      │
+│  • ROS2 camera sub   │  • JPEG video frames (10 fps)        │  • YOLO detection    │
+│  • ROS2 depth sub    │  • Depth maps (compressed)           │  • Face recognition  │
+│  • Robot SDK control │  • Audio from robot mic              │  • Gemini Live API   │
+│  • Dance choreography│                                       │  • Tracking/Follow   │
+│  • Audio playback    │  Server → Robot:                      │  • Web UI (:8080)    │
+│                      │  • Move/head/dance commands (JSON)   │  • Audio I/O         │
+│                      │  • Gemini speech audio               │                      │
+└──────────────────────┘                                       └──────────────────────┘
+```
+
+### Quick Start (Remote Mode)
+
+**1. On your PC/laptop (the server):**
+
+```bash
+pip install websockets
+
+export GEMINI_API_KEY="your-key-here"
+python3 server.py --voice Puck
+# Web UI at http://localhost:8080
+# Robot WebSocket at ws://0.0.0.0:9090
+```
+
+**2. On the robot:**
+
+```bash
+pip install websockets
+
+python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090
+```
+
+### Server Arguments
+
+```
+python3 server.py [options]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--api-key` | `$GEMINI_API_KEY` | Gemini API key |
+| `--voice` | `Puck` | Voice: Puck, Charon, Kore, Fenrir, Aoede |
+| `--port` | `8080` | Web UI port |
+| `--ws-port` | `9090` | WebSocket port for robot connection |
+| `--model` | `yolov8n.pt` | YOLO model path |
+| `--confidence` | `0.5` | Detection confidence threshold |
+| `--no-faces` | off | Disable face recognition |
+| `--follow-distance` | `1.0` | Target follow distance in meters |
+| `--audio-source` | `robot` | `robot` = stream from robot mic, `local` = use PC mic |
+| `--mic-gain` | `3.0` | Mic gain (for `--audio-source local`) |
+
+### Robot Client Arguments
+
+```
+python3 robot_client.py <interface> [options]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `interface` | *(required)* | Network interface for robot SDK (e.g. `eth0`) |
+| `--server` | `ws://localhost:9090` | Server WebSocket URL |
+| `--fps` | `10` | Video stream FPS |
+| `--depth-fps` | `5` | Depth stream FPS |
+| `--mic-gain` | `3.0` | Robot mic gain multiplier |
+| `--mic-device` | auto | PyAudio mic device index |
+
+## On-Robot Mode (`gemini_robot_control.py`)
+
+The original all-in-one script — runs everything on the robot. Simpler setup but slower since the robot handles all ML inference.
 
 ### Features
 
@@ -172,14 +247,15 @@ pip install -r requirements.txt
 ```
 
 Key packages:
-- `booster-robotics-sdk-python` — K1 robot SDK
-- `google-genai` — Gemini Live API
-- `ultralytics` — YOLOv8
-- `face_recognition` — face detection and recognition
-- `opencv-python` — image processing
-- `pyaudio` — audio I/O
-- `rclpy`, `sensor_msgs`, `cv_bridge` — ROS 2 camera interface
-- `numpy`, `torch`, `torchvision` — ML inference
+- `websockets` — robot ↔ server communication (needed on both sides)
+- `booster-robotics-sdk-python` — K1 robot SDK (robot only)
+- `google-genai` — Gemini Live API (server only)
+- `ultralytics` — YOLOv8 (server only)
+- `face_recognition` — face detection and recognition (server only)
+- `opencv-python` — image processing (both)
+- `pyaudio` — audio I/O (both)
+- `rclpy`, `sensor_msgs`, `cv_bridge` — ROS 2 camera interface (robot only)
+- `numpy` — numerical operations (both)
 
 ## Troubleshooting
 
