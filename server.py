@@ -461,6 +461,64 @@ class FrameProcessor:
             lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist})")
         return "Detected objects:\n" + "\n".join(lines)
 
+    def get_pointcloud_binary(self, step=4, max_depth=6.0, fx=320, fy=320, cx=None, cy=None):
+        """Generate a colored point cloud from depth + RGB.
+
+        Returns bytes: N x 6 float32 array [x, y, z, r, g, b] (colors 0-1).
+        Downsamples by `step` for performance.
+        """
+        depth_map = self._depth_map
+        raw_frame = self._raw_frame
+        if depth_map is None or raw_frame is None:
+            return None
+
+        dh, dw = depth_map.shape
+        fh, fw = raw_frame.shape[:2]
+
+        if cx is None:
+            cx = dw / 2.0
+        if cy is None:
+            cy = dh / 2.0
+
+        # Scale intrinsics if depth and frame have different resolutions
+        scale_x = dw / fw
+        scale_y = dh / fh
+        fx_d = fx * scale_x
+        fy_d = fy * scale_y
+
+        # Resample RGB to depth resolution
+        if (fh, fw) != (dh, dw):
+            rgb = cv2.resize(raw_frame, (dw, dh))
+        else:
+            rgb = raw_frame
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+
+        # Build pixel coordinate grids (downsampled)
+        ys = np.arange(0, dh, step)
+        xs = np.arange(0, dw, step)
+        xx, yy = np.meshgrid(xs, ys)
+
+        depths = depth_map[yy, xx].astype(np.float32) / 1000.0  # mm -> meters
+        colors_r = rgb[yy, xx, 0].astype(np.float32) / 255.0
+        colors_g = rgb[yy, xx, 1].astype(np.float32) / 255.0
+        colors_b = rgb[yy, xx, 2].astype(np.float32) / 255.0
+
+        # Filter valid depths
+        valid = (depths > 0.05) & (depths < max_depth)
+        z = depths[valid]
+        u = xx.astype(np.float32)[valid]
+        v = yy.astype(np.float32)[valid]
+        r = colors_r[valid]
+        g = colors_g[valid]
+        b = colors_b[valid]
+
+        # Deproject to 3D (camera coordinates: x=right, y=down, z=forward)
+        x = (u - cx) * z / fx_d
+        y = (v - cy) * z / fy_d
+
+        points = np.stack([x, -y, -z, r, g, b], axis=-1).astype(np.float32)
+        return points.tobytes()
+
 
 # ── Remote Robot Controller ──────────────────────────────────────────────────
 
@@ -692,11 +750,136 @@ class RobotController:
             self.follow_thread = None
         self._move(0, 0, 0)
 
-    def _follow_loop(self):
+    def _scan_depth_obstacles(self, depth_map, target_distance=None):
+        """Fine-grained depth + edge scanning for obstacle avoidance.
+
+        Scans the depth map in a high-resolution grid and also detects sharp
+        depth discontinuities (table edges, step-offs, beams, pillars).
+
+        Returns dict with:
+            zone_min[i]   - minimum depth (meters) per column (12 cols)
+            edge_score[i] - depth-edge severity per column (0-1)
+            left_clear    - clearance score for left path
+            right_clear   - clearance score for right path
+            center_clear  - clearance score for center path
+            closest       - closest obstacle distance in center corridor
+            has_obstacle  - True if any obstacle < threshold in path
+            emergency     - True if very close obstacle detected
+            best_side     - 'left' or 'right' indicating clearer path
+        """
+        dh, dw = depth_map.shape
+        N_COLS = 12
+        N_ROWS = 4
         OBSTACLE_DIST = 0.9
-        OBSTACLE_EMERGENCY = 0.5
+        EMERGENCY_DIST = 0.45
+        EDGE_GRADIENT_THRESH = 0.3  # meters of depth change = edge
+
+        target_d = target_distance if target_distance else 5.0
+        col_w = dw // N_COLS
+
+        # Scan the path-relevant portion (middle 30%-80% of height)
+        y_top = int(dh * 0.25)
+        y_bot = int(dh * 0.85)
+        strip = depth_map[y_top:y_bot, :]
+        strip_h = y_bot - y_top
+        row_h = strip_h // N_ROWS
+
+        zone_min = []    # minimum depth per column
+        edge_score = []  # depth-edge severity per column
+
+        for c in range(N_COLS):
+            x1 = c * col_w
+            x2 = x1 + col_w if c < N_COLS - 1 else dw
+            col_data = strip[:, x1:x2]
+
+            # Minimum depth across rows (catches narrow obstacles at any height)
+            row_mins = []
+            for r in range(N_ROWS):
+                ry1 = r * row_h
+                ry2 = ry1 + row_h if r < N_ROWS - 1 else strip_h
+                cell = col_data[ry1:ry2, :]
+                valid = cell[(cell > 0) & (cell < 65535)].astype(np.float32)
+                if len(valid) > 10:
+                    row_mins.append(float(np.percentile(valid, 15)) / 1000.0)
+
+            col_min = min(row_mins) if row_mins else 10.0
+            zone_min.append(col_min)
+
+            # Depth gradient: detect sharp depth changes within the column
+            # (table edges, step-downs, beam edges)
+            col_float = col_data.astype(np.float32)
+            col_float[col_data == 0] = np.nan
+            col_float[col_data >= 65535] = np.nan
+
+            max_grad = 0.0
+            # Vertical gradient (top-to-bottom depth jumps = table/step edges)
+            for r in range(N_ROWS - 1):
+                ry1 = r * row_h
+                ry2 = ry1 + row_h
+                ry3 = min(ry2 + row_h, strip_h)
+                upper = col_float[ry1:ry2, :]
+                lower = col_float[ry2:ry3, :]
+                u_valid = upper[np.isfinite(upper)]
+                l_valid = lower[np.isfinite(lower)]
+                if len(u_valid) > 10 and len(l_valid) > 10:
+                    diff = abs(float(np.median(l_valid)) - float(np.median(u_valid))) / 1000.0
+                    max_grad = max(max_grad, diff)
+
+            # Horizontal gradient (left-right depth jumps = pillars, beam edges)
+            half = col_data.shape[1] // 2
+            if half > 2:
+                left_half = col_float[:, :half]
+                right_half = col_float[:, half:]
+                lv = left_half[np.isfinite(left_half)]
+                rv = right_half[np.isfinite(right_half)]
+                if len(lv) > 10 and len(rv) > 10:
+                    hdiff = abs(float(np.median(rv)) - float(np.median(lv))) / 1000.0
+                    max_grad = max(max_grad, hdiff)
+
+            e_score = min(1.0, max_grad / EDGE_GRADIENT_THRESH) if max_grad > 0.1 else 0.0
+            edge_score.append(e_score)
+
+        # Combine: effective obstacle distance considers both raw depth and edges
+        # An edge at 0.8m with high gradient score is dangerous even if median depth is fine
+        effective = []
+        for i in range(N_COLS):
+            eff = zone_min[i]
+            if edge_score[i] > 0.5 and zone_min[i] < 1.5:
+                eff = min(eff, zone_min[i] * (1.0 - edge_score[i] * 0.4))
+            effective.append(eff)
+
+        # Score left / center / right paths
+        left_cols = effective[:4]        # left third
+        center_cols = effective[3:9]     # center half (overlaps slightly for safety)
+        right_cols = effective[8:]       # right third
+
+        left_clear = min(left_cols) if left_cols else 10.0
+        center_clear = min(center_cols) if center_cols else 10.0
+        right_clear = min(right_cols) if right_cols else 10.0
+
+        closest = center_clear
+        has_obstacle = closest < OBSTACLE_DIST and closest < target_d - 0.3
+        emergency = closest < EMERGENCY_DIST
+
+        best_side = 'left' if left_clear > right_clear else 'right'
+
+        return {
+            'zone_min': zone_min,
+            'edge_score': edge_score,
+            'effective': effective,
+            'left_clear': left_clear,
+            'center_clear': center_clear,
+            'right_clear': right_clear,
+            'closest': closest,
+            'has_obstacle': has_obstacle,
+            'emergency': emergency,
+            'best_side': best_side,
+        }
+
+    def _follow_loop(self):
         STRAFE_SPEED = 0.25
         MAX_FWD = 0.5
+        OBSTACLE_DIST = 0.9
 
         while self.follow_active:
             fp = self.frame_processor
@@ -744,50 +927,53 @@ class RobotController:
             strafe_speed = 0.0
             obstacle_ahead = False
 
+            # Depth-based obstacle + edge detection
             depth_map = fp._depth_map
             if depth_map is not None and fwd_speed > 0:
-                dh, dw = depth_map.shape
-                strip_y1, strip_y2 = int(dh * 0.35), int(dh * 0.75)
-                strip = depth_map[strip_y1:strip_y2, :]
-                n_zones = 5
-                zone_w = dw // n_zones
-                zone_depths = []
-                for i in range(n_zones):
-                    col1 = i * zone_w
-                    col2 = col1 + zone_w if i < n_zones - 1 else dw
-                    zone = strip[:, col1:col2]
-                    valid = zone[(zone > 0) & (zone < 65535)].astype(np.float32)
-                    d = float(np.median(valid)) / 1000.0 if len(valid) > 20 else 10.0
-                    zone_depths.append(d)
+                scan = self._scan_depth_obstacles(depth_map, distance)
 
-                center_d = zone_depths[2]
-                near_left_d, near_right_d = zone_depths[1], zone_depths[3]
-                far_left_d, far_right_d = zone_depths[0], zone_depths[4]
-                target_d = distance if distance else 5.0
-
-                if center_d < OBSTACLE_DIST and center_d < target_d - 0.3:
+                if scan['has_obstacle']:
                     obstacle_ahead = True
-                    left_clear = (far_left_d + near_left_d) / 2
-                    right_clear = (far_right_d + near_right_d) / 2
 
-                    if center_d < OBSTACLE_EMERGENCY:
+                    if scan['emergency']:
                         fwd_speed = min(fwd_speed, 0.05)
-                        if left_clear > right_clear:
-                            strafe_speed, rot_speed = STRAFE_SPEED, max(rot_speed, 0.3)
+                        if scan['best_side'] == 'left':
+                            strafe_speed = STRAFE_SPEED
+                            rot_speed = max(rot_speed, 0.35)
                         else:
-                            strafe_speed, rot_speed = -STRAFE_SPEED, min(rot_speed, -0.3)
+                            strafe_speed = -STRAFE_SPEED
+                            rot_speed = min(rot_speed, -0.35)
+                        print(f"[Follow] CLOSE obstacle {scan['closest']:.2f}m — strafe {scan['best_side']}")
                     else:
                         fwd_speed = min(fwd_speed, 0.15)
-                        if left_clear > right_clear:
-                            rot_speed, strafe_speed = max(rot_speed, 0.25), 0.15
+                        if scan['best_side'] == 'left':
+                            rot_speed = max(rot_speed, 0.25)
+                            strafe_speed = 0.15
                         else:
-                            rot_speed, strafe_speed = min(rot_speed, -0.25), -0.15
+                            rot_speed = min(rot_speed, -0.25)
+                            strafe_speed = -0.15
+                        print(f"[Follow] Obstacle {scan['closest']:.2f}m — steer {scan['best_side']}")
 
-                elif near_left_d < OBSTACLE_EMERGENCY:
-                    strafe_speed = -0.15
-                elif near_right_d < OBSTACLE_EMERGENCY:
-                    strafe_speed = 0.15
+                else:
+                    # No center obstacle, but check sides for grazing
+                    if scan['left_clear'] < 0.45:
+                        strafe_speed = -0.12
+                    elif scan['right_clear'] < 0.45:
+                        strafe_speed = 0.12
 
+                    # Check for edge hazards even when path seems clear
+                    center_edges = scan['edge_score'][3:9]
+                    max_edge = max(center_edges) if center_edges else 0
+                    if max_edge > 0.7 and scan['center_clear'] < 1.2:
+                        fwd_speed = min(fwd_speed, 0.15)
+                        edge_idx = 3 + center_edges.index(max_edge)
+                        if edge_idx < 6:
+                            strafe_speed = max(strafe_speed, -0.1)
+                        else:
+                            strafe_speed = min(strafe_speed, 0.1)
+                        print(f"[Follow] Edge detected (score {max_edge:.2f}) — slowing")
+
+            # YOLO detection fallback for non-depth-detected objects
             if fwd_speed > 0 and not obstacle_ahead:
                 with fp._lock:
                     all_dets = list(fp.latest_detections)
@@ -882,27 +1068,34 @@ class RobotController:
             else:
                 fwd_speed = 0.3
 
+            strafe_speed = 0.0
             depth_map = fp._depth_map
             if depth_map is not None:
-                dh, dw = depth_map.shape
-                strip_y1, strip_y2 = int(dh * 0.4), int(dh * 0.7)
-                strip = depth_map[strip_y1:strip_y2, :]
-                third = dw // 3
+                scan = self._scan_depth_obstacles(depth_map, distance)
 
-                def _zone_depth(s):
-                    valid = s[(s > 0) & (s < 65535)].astype(np.float32)
-                    return float(np.median(valid)) / 1000.0 if len(valid) > 20 else 10.0
+                if scan['has_obstacle']:
+                    if scan['emergency']:
+                        fwd_speed = min(fwd_speed, 0.05)
+                        strafe_speed = 0.2 if scan['best_side'] == 'left' else -0.2
+                        rot_speed = STEER_SPEED if scan['best_side'] == 'left' else -STEER_SPEED
+                    else:
+                        fwd_speed = min(fwd_speed, 0.2)
+                        rot_speed = STEER_SPEED if scan['best_side'] == 'left' else -STEER_SPEED
 
-                left_d = _zone_depth(strip[:, :third])
-                center_d = _zone_depth(strip[:, third:2*third])
-                right_d = _zone_depth(strip[:, 2*third:])
+                    print(f"[GoTo] Obstacle {scan['closest']:.2f}m — steer {scan['best_side']}")
 
-                target_dist = distance if distance else 5.0
-                if center_d < OBSTACLE_DIST and center_d < target_dist - 0.5:
-                    rot_speed = STEER_SPEED if left_d > right_d else -STEER_SPEED
-                    fwd_speed = min(fwd_speed, 0.2)
+                elif scan['left_clear'] < 0.45:
+                    strafe_speed = -0.1
+                elif scan['right_clear'] < 0.45:
+                    strafe_speed = 0.1
 
-            self._move(fwd_speed, 0.0, rot_speed)
+                center_edges = scan['edge_score'][3:9]
+                max_edge = max(center_edges) if center_edges else 0
+                if max_edge > 0.7 and scan['center_clear'] < 1.2:
+                    fwd_speed = min(fwd_speed, 0.15)
+                    print(f"[GoTo] Edge hazard (score {max_edge:.2f}) — slowing")
+
+            self._move(fwd_speed, strafe_speed, rot_speed)
             time.sleep(0.05)
 
         self._move(0, 0, 0)
@@ -1164,7 +1357,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... speak commands or use buttons above</div>
+    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">Open 3D View</a></div>
   </div>
 <script>
   const img = document.getElementById('feed');
@@ -1302,6 +1495,189 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
+HTML_3D_PAGE = r"""<!DOCTYPE html>
+<html>
+<head>
+<title>3D Point Cloud — Robot View</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; font-family:system-ui,sans-serif; }
+  canvas { display:block; }
+  #hud {
+    position:absolute; top:12px; left:12px; color:#eee; font-size:13px;
+    background:rgba(0,0,0,0.7); padding:10px 14px; border-radius:8px;
+    pointer-events:none; line-height:1.6;
+  }
+  #hud b { color:#4CAF50; }
+  #controls {
+    position:absolute; top:12px; right:12px; color:#eee; font-size:12px;
+    background:rgba(0,0,0,0.7); padding:10px 14px; border-radius:8px;
+  }
+  #controls label { display:block; margin:4px 0; }
+  #controls input[type=range] { width:120px; vertical-align:middle; }
+  #controls button {
+    margin-top:8px; padding:6px 14px; background:#4CAF50; color:#000;
+    border:none; border-radius:6px; font-weight:bold; cursor:pointer; font-size:12px;
+  }
+  #controls button:hover { background:#66BB6A; }
+  #back-link {
+    position:absolute; bottom:12px; left:12px;
+    color:#4CAF50; font-size:13px; text-decoration:none;
+    background:rgba(0,0,0,0.7); padding:6px 12px; border-radius:6px;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>3D Point Cloud</b> — Robot Depth View<br>
+  Points: <span id="npts">0</span> | FPS: <span id="fps">0</span><br>
+  Drag to orbit · Scroll to zoom · Right-drag to pan
+</div>
+<div id="controls">
+  <label>Point size <input type="range" id="psize" min="1" max="8" step="0.5" value="2"></label>
+  <label>Max depth (m) <input type="range" id="maxd" min="1" max="10" step="0.5" value="6"></label>
+  <label>Refresh (ms) <input type="range" id="interval" min="100" max="2000" step="100" value="500"></label>
+  <label><input type="checkbox" id="autoRotate"> Auto-rotate</label>
+  <button onclick="resetView()">Reset View</button>
+</div>
+<a id="back-link" href="/">← Back to Control Panel</a>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 50);
+camera.position.set(0, 1.5, 2);
+camera.lookAt(0, 0, -2);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, -2);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+controls.update();
+
+// Grid floor
+const grid = new THREE.GridHelper(10, 20, 0x333333, 0x222222);
+grid.rotation.x = 0;
+scene.add(grid);
+
+// Axes
+scene.add(new THREE.AxesHelper(1));
+
+// Origin marker (robot position)
+const markerGeo = new THREE.SphereGeometry(0.05, 16, 16);
+const markerMat = new THREE.MeshBasicMaterial({ color: 0x4CAF50 });
+scene.add(new THREE.Mesh(markerGeo, markerMat));
+
+// Point cloud
+const MAX_POINTS = 200000;
+const geometry = new THREE.BufferGeometry();
+const positions = new Float32Array(MAX_POINTS * 3);
+const colors = new Float32Array(MAX_POINTS * 3);
+geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geometry.setDrawRange(0, 0);
+
+const material = new THREE.PointsMaterial({
+  size: 2, vertexColors: true, sizeAttenuation: true,
+  transparent: true, opacity: 0.85,
+});
+const points = new THREE.Points(geometry, material);
+scene.add(points);
+
+// UI controls
+const psizeEl = document.getElementById('psize');
+const maxdEl = document.getElementById('maxd');
+const intervalEl = document.getElementById('interval');
+const autoRotEl = document.getElementById('autoRotate');
+const nptsEl = document.getElementById('npts');
+const fpsEl = document.getElementById('fps');
+
+psizeEl.addEventListener('input', () => { material.size = parseFloat(psizeEl.value); });
+autoRotEl.addEventListener('change', () => { controls.autoRotate = autoRotEl.checked; });
+
+window.resetView = function() {
+  camera.position.set(0, 1.5, 2);
+  controls.target.set(0, 0, -2);
+  controls.update();
+};
+
+// Fetch point cloud
+let refreshInterval = 500;
+intervalEl.addEventListener('input', () => { refreshInterval = parseInt(intervalEl.value); });
+
+async function fetchCloud() {
+  try {
+    const maxDepth = parseFloat(maxdEl.value);
+    const resp = await fetch('/pointcloud?max_depth=' + maxDepth);
+    if (!resp.ok) { setTimeout(fetchCloud, refreshInterval); return; }
+    const buf = await resp.arrayBuffer();
+    const floats = new Float32Array(buf);
+    const nPoints = Math.min(floats.length / 6, MAX_POINTS);
+
+    const pos = geometry.attributes.position.array;
+    const col = geometry.attributes.color.array;
+    for (let i = 0; i < nPoints; i++) {
+      const si = i * 6;
+      const di = i * 3;
+      pos[di]     = floats[si];     // x
+      pos[di + 1] = floats[si + 1]; // y
+      pos[di + 2] = floats[si + 2]; // z
+      col[di]     = floats[si + 3]; // r
+      col[di + 1] = floats[si + 4]; // g
+      col[di + 2] = floats[si + 5]; // b
+    }
+    geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.color.needsUpdate = true;
+    geometry.setDrawRange(0, nPoints);
+    nptsEl.textContent = nPoints.toLocaleString();
+  } catch(e) {}
+  setTimeout(fetchCloud, refreshInterval);
+}
+fetchCloud();
+
+// Render loop
+let frames = 0, lastFpsTime = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsTime > 1000) {
+    fpsEl.textContent = Math.round(frames * 1000 / (now - lastFpsTime));
+    frames = 0;
+    lastFpsTime = now;
+  }
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>"""
+
+
 class WebHandler(BaseHTTPRequestHandler):
     frame_processor = None
     robot_controller = None
@@ -1357,6 +1733,26 @@ class WebHandler(BaseHTTPRequestHandler):
             robot = self.robot_controller
             connected = robot is not None and robot._ws is not None
             self._json_response({'connected': connected})
+        elif self.path.startswith('/pointcloud'):
+            fp = self.frame_processor
+            if not fp:
+                self.send_error(503, 'Not ready')
+                return
+            pcl = fp.get_pointcloud_binary(step=4, max_depth=6.0)
+            if pcl is None:
+                self.send_error(503, 'No depth data')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(pcl)
+        elif self.path == '/3d':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_3D_PAGE.encode())
         else:
             self.send_error(404)
 
