@@ -29,10 +29,20 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
 import cv2
-import pyaudio
+# Prefer compat on macOS to avoid "Could not import the PyAudio C module" and dylib issues
+if sys.platform == 'darwin':
+    import pyaudio_compat as pyaudio
+else:
+    try:
+        import pyaudio
+    except ImportError:
+        import pyaudio_compat as pyaudio
 
 from ultralytics import YOLO
-import face_recognition
+try:
+    import face_recognition
+except (ImportError, OSError):
+    face_recognition = None  # e.g. dlib wrong arch on Apple Silicon
 
 from google import genai
 from google.genai import types
@@ -157,6 +167,8 @@ class FaceCache:
             print(f"Warning: failed to save face cache: {e}")
 
     def recognize(self, encoding):
+        if face_recognition is None:
+            return None
         with self._lock:
             if not self.entries:
                 return None
@@ -353,6 +365,8 @@ class FrameProcessor:
             self.latest_detections = detections
 
     def _run_face_recognition(self, frame):
+        if face_recognition is None:
+            return []
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_locs = face_recognition.face_locations(rgb, model='cnn')
         if not face_locs:
@@ -373,6 +387,8 @@ class FrameProcessor:
         return results
 
     def _get_or_assign_unknown_id(self, encoding):
+        if face_recognition is None:
+            return 0
         best_dist, best_id = 999.0, None
         for uid, enc in self._unknown_faces.items():
             dist = float(face_recognition.face_distance([enc], encoding)[0])
@@ -1645,12 +1661,15 @@ async def run_server(args):
     os.environ.pop('GEMINI_API_KEY', None)
 
     face_cache = None
-    if not args.no_faces:
+    if not args.no_faces and face_recognition is not None:
         face_cache = FaceCache(tolerance=args.face_tolerance)
 
+    enable_faces = (not args.no_faces) and (face_recognition is not None)
+    if not enable_faces and face_recognition is None:
+        print("Note: face_recognition/dlib not available; running without face recognition.")
     frame_processor = FrameProcessor(
         model_path=args.model, confidence=args.confidence,
-        face_cache=face_cache, enable_faces=not args.no_faces,
+        face_cache=face_cache, enable_faces=enable_faces,
     )
     _frame_processor_ref = frame_processor
 
@@ -1668,11 +1687,18 @@ async def run_server(args):
     robot_ws_ref = {'ws': None}
 
     # WebSocket server for robot connection
-    import websockets.server
-    ws_server = await websockets.server.serve(
-        lambda ws: handle_robot_ws(ws, frame_processor, robot, audio_queue, robot_ws_ref),
+    import websockets
+    print(f"websockets version: {websockets.__version__}")
+
+    async def _ws_handler(websocket, path=None):
+        await handle_robot_ws(websocket, frame_processor, robot, audio_queue, robot_ws_ref)
+
+    ws_server = await websockets.serve(
+        _ws_handler,
         '0.0.0.0', args.ws_port,
         max_size=10 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=60,
     )
     print(f"Robot WebSocket: ws://0.0.0.0:{args.ws_port}")
     print(f"  Tell robot_client.py to connect to: ws://<THIS_IP>:{args.ws_port}")

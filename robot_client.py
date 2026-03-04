@@ -20,7 +20,10 @@ import zlib
 
 import numpy as np
 import cv2
-import pyaudio
+try:
+    import pyaudio
+except ImportError:
+    import pyaudio_compat as pyaudio
 import websockets
 
 import rclpy
@@ -464,10 +467,17 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
 
     uri = args.server
     print(f"Connecting to server: {uri}")
+    print(f"websockets version: {websockets.__version__}")
 
     while True:
         try:
-            async with websockets.connect(uri, max_size=10 * 1024 * 1024) as ws:
+            async with websockets.connect(
+                uri,
+                max_size=10 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=60,
+                open_timeout=10,
+            ) as ws:
                 print("Connected to server!")
                 tasks = [
                     asyncio.create_task(_stream_video(ws, camera, args.fps)),
@@ -483,8 +493,8 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
                     for t in tasks:
                         t.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-        except (ConnectionRefusedError, OSError) as e:
-            print(f"Cannot connect ({e}), retrying in 3s...")
+        except Exception as e:
+            print(f"Connection error ({type(e).__name__}: {e}), retrying in 3s...")
         await asyncio.sleep(3)
 
 
