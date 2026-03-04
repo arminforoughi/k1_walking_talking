@@ -259,6 +259,13 @@ class RobotExecutor:
     def _cmd_flex(self, _):
         threading.Thread(target=self._flex, daemon=True).start()
 
+    def _cmd_get_up(self, _):
+        """Run the SDK get-up motion (e.g. from lying down to standing)."""
+        def _do():
+            with self.lock:
+                self.client.GetUp()
+        threading.Thread(target=_do, daemon=True).start()
+
     # ── Arm commands (for server-driven choreography if needed)
 
     def _cmd_arm_to_side(self, m):

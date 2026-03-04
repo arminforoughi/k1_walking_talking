@@ -766,6 +766,9 @@ class RobotController:
     def do_flex(self):
         self._send({'cmd': 'flex'})
 
+    def do_get_up(self):
+        self._send({'cmd': 'get_up'})
+
     # ── Tracking ─────────────────────────────────────────────────────────
 
     def start_tracking(self, target=None):
@@ -1154,6 +1157,7 @@ class CommandDispatcher:
             "handshake": self.robot.do_handshake,
             "dab": self.robot.do_dab,
             "flex": self.robot.do_flex,
+            "get_up": self.robot.do_get_up,
             "track": lambda: self.robot.start_tracking(target),
             "look_left": lambda: self.robot.rotate_head(0.0, 0.5),
             "look_right": lambda: self.robot.rotate_head(0.0, -0.5),
@@ -1624,6 +1628,8 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.do_dab()
         elif action == 'flex':
             robot.do_flex()
+        elif action == 'get_up':
+            robot.do_get_up()
         elif action == 'nod':
             robot.nod()
         elif action == 'head_shake':
