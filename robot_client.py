@@ -28,7 +28,7 @@ import websockets
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image, CompressedImage, PointCloud2
 from cv_bridge import CvBridge
 
 from booster_robotics_sdk_python import (
@@ -46,27 +46,32 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03  # robot mic -> server
+MSG_POINTCLOUD = 0x04
 
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
 
 
 class CameraStreamer(Node):
-    """ROS2 node: subscribes to camera + depth, buffers latest frames."""
+    """ROS2 node: subscribes to camera + depth + pointcloud, buffers latest frames."""
 
-    def __init__(self):
+    def __init__(self, pointcloud_topic='/StereoNetNode/stereonet_pointcloud'):
         super().__init__('robot_stream_client')
         self.bridge = CvBridge()
         self._lock = threading.Lock()
         self._frame_jpeg = None
         self._depth_compressed = None
+        self._pointcloud_compressed = None
         self._new_frame = threading.Event()
         self._new_depth = threading.Event()
+        self._new_pointcloud = threading.Event()
         self._raw_frame = None
 
         self.create_subscription(Image, '/image_left_raw', self._on_image, 10)
         self.create_subscription(CompressedImage, '/booster_video_stream', self._on_compressed, 10)
         self.create_subscription(Image, '/StereoNetNode/stereonet_depth', self._on_depth, 10)
+        self.create_subscription(PointCloud2, pointcloud_topic, self._on_pointcloud, 10)
+        self.get_logger().info(f'Subscribed to pointcloud: {pointcloud_topic}')
 
     def _on_image(self, msg):
         try:
@@ -128,6 +133,44 @@ class CameraStreamer(Node):
         self._new_depth.clear()
         with self._lock:
             return self._depth_compressed
+
+    def _on_pointcloud(self, msg):
+        try:
+            point_step = msg.point_step
+            row_step = msg.row_step
+            h, w = msg.height, msg.width
+            if h == 0:
+                h = 1
+                w = len(msg.data) // point_step
+
+            raw = np.frombuffer(msg.data, dtype=np.uint8)
+            points = raw.reshape((h, w, point_step))
+            xyz = np.zeros((h, w, 3), dtype=np.float32)
+            for i, offset in enumerate([0, 4, 8]):
+                xyz[:, :, i] = np.frombuffer(
+                    points[:, :, offset:offset+4].tobytes(), dtype=np.float32
+                ).reshape((h, w))
+
+            step = 2
+            small = xyz[::step, ::step, :]
+            sh, sw = small.shape[:2]
+
+            finite_mask = np.isfinite(small)
+            small = np.where(finite_mask, small, 0.0)
+
+            quant = (small * 1000).clip(-32768, 32767).astype(np.int16)
+            header = struct.pack('<HH', sw, sh)
+            compressed = zlib.compress(quant.tobytes(), level=1)
+            with self._lock:
+                self._pointcloud_compressed = header + compressed
+            self._new_pointcloud.set()
+        except Exception as e:
+            self.get_logger().error(f'Pointcloud error: {e}')
+
+    def take_pointcloud(self):
+        self._new_pointcloud.clear()
+        with self._lock:
+            return self._pointcloud_compressed
 
 
 # ── Robot Command Executor ──────────────────────────────────────────────────
@@ -215,6 +258,13 @@ class RobotExecutor:
 
     def _cmd_flex(self, _):
         threading.Thread(target=self._flex, daemon=True).start()
+
+    def _cmd_get_up(self, _):
+        """Run the SDK get-up motion (e.g. from lying down to standing)."""
+        def _do():
+            with self.lock:
+                self.client.GetUp()
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Arm commands (for server-driven choreography if needed)
 
@@ -482,6 +532,7 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
                 tasks = [
                     asyncio.create_task(_stream_video(ws, camera, args.fps)),
                     asyncio.create_task(_stream_depth(ws, camera, args.depth_fps)),
+                    asyncio.create_task(_stream_pointcloud(ws, camera, args.pointcloud_fps)),
                     asyncio.create_task(_stream_audio(ws, pya, mic_device, args.mic_gain)),
                     asyncio.create_task(_receive_commands(ws, executor, pya)),
                 ]
@@ -517,6 +568,18 @@ async def _stream_depth(ws, camera: CameraStreamer, fps):
             data = camera.take_depth()
             if data:
                 await ws.send(bytes([MSG_DEPTH]) + data)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _stream_pointcloud(ws, camera: CameraStreamer, fps):
+    interval = 1.0 / fps
+    try:
+        while True:
+            data = camera.take_pointcloud()
+            if data:
+                await ws.send(bytes([MSG_POINTCLOUD]) + data)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass
@@ -583,6 +646,10 @@ def main():
                         help='WebSocket server URL (e.g. ws://192.168.1.100:9090)')
     parser.add_argument('--fps', type=int, default=10, help='Video stream FPS')
     parser.add_argument('--depth-fps', type=int, default=5, help='Depth stream FPS')
+    parser.add_argument('--pointcloud-fps', type=int, default=2, help='Pointcloud stream FPS')
+    parser.add_argument('--pointcloud-topic', type=str,
+                        default='/StereoNetNode/stereonet_pointcloud',
+                        help='ROS2 PointCloud2 topic')
     parser.add_argument('--mic-gain', type=float, default=3.0, help='Mic gain multiplier')
     parser.add_argument('--mic-device', type=int, default=None, help='PyAudio mic device index')
     args = parser.parse_args()
@@ -590,7 +657,7 @@ def main():
     print("=" * 60)
     print("K1 Robot Client")
     print(f"  Streaming to: {args.server}")
-    print(f"  Video: {args.fps} fps | Depth: {args.depth_fps} fps")
+    print(f"  Video: {args.fps} fps | Depth: {args.depth_fps} fps | PointCloud: {args.pointcloud_fps} fps")
     print("=" * 60)
 
     # Robot SDK
@@ -611,7 +678,7 @@ def main():
 
     # ROS2
     rclpy.init()
-    camera = CameraStreamer()
+    camera = CameraStreamer(pointcloud_topic=args.pointcloud_topic)
     ros_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
     ros_thread.start()
 

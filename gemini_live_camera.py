@@ -116,6 +116,8 @@ class FaceCache:
 
     def recognize(self, encoding):
         """Return best matching name, or None if no match within tolerance."""
+        if face_recognition is None:
+            return None
         with self._lock:
             if not self.entries:
                 return None
@@ -280,6 +282,8 @@ class CameraDetectionNode(Node):
 
     def _get_or_assign_unknown_id(self, encoding):
         """Find existing unknown temp ID for this face, or assign a new one."""
+        if face_recognition is None:
+            return 0
         best_dist = 999.0
         best_id = None
         for uid, enc in self._unknown_faces.items():
@@ -299,6 +303,8 @@ class CameraDetectionNode(Node):
 
     def _run_face_recognition(self, frame):
         """Run face detection + encoding + matching. Returns list of face results."""
+        if face_recognition is None:
+            return []
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_locs = face_recognition.face_locations(rgb, model='cnn')
         if not face_locs:
