@@ -38,7 +38,7 @@ else:
     except ImportError:
         import pyaudio_compat as pyaudio
 
-from ultralytics import YOLO
+from ultralytics import YOLO, FastSAM
 try:
     import face_recognition
 except (ImportError, OSError):
@@ -58,6 +58,7 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03
+MSG_POINTCLOUD = 0x04
 # server -> robot
 MSG_AUDIO_OUT = 0x10
 
@@ -211,12 +212,19 @@ class FrameProcessor:
     """Receives frames from robot WebSocket, runs YOLO + face recognition."""
 
     def __init__(self, model_path='yolov8n.pt', confidence=0.5,
-                 face_cache=None, enable_faces=True):
+                 face_cache=None, enable_faces=True,
+                 seg_model_path=None, enable_segmentation=True):
         print(f'Loading YOLO model: {model_path}')
         self.model = YOLO(model_path)
         self.confidence = confidence
         self.enable_faces = enable_faces
         self.face_cache = face_cache
+
+        self.enable_segmentation = enable_segmentation and seg_model_path is not None
+        self.seg_model = None
+        if self.enable_segmentation:
+            print(f'Loading FastSAM model: {seg_model_path}')
+            self.seg_model = FastSAM(seg_model_path)
 
         self._unknown_faces = {}
         self._next_unknown_id = 1
@@ -229,15 +237,26 @@ class FrameProcessor:
         self.latest_detections = []
         self._raw_frame = None         # original decoded frame
         self._depth_map = None         # uint16 depth
+        self._pointcloud = None        # float32 [H, W, 3] XYZ in meters
         self._frame_shape = None       # (h, w)
         self._fps = 0.0
         self._fps_counter = 0
         self._fps_time = time.time()
 
+        self._segment_masks = []
+        self._segment_info = []
+        self._seg_overlay = None
+
         self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self._pending_frame = None
         self._detect_event = threading.Event()
         self._detect_thread.start()
+
+        if self.enable_segmentation:
+            self._seg_thread = threading.Thread(target=self._segmentation_loop, daemon=True)
+            self._seg_pending_frame = None
+            self._seg_event = threading.Event()
+            self._seg_thread.start()
 
     def on_video_frame(self, jpeg_bytes):
         frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -246,6 +265,9 @@ class FrameProcessor:
             self._frame_shape = frame.shape[:2]
             self._pending_frame = frame
             self._detect_event.set()
+            if self.enable_segmentation:
+                self._seg_pending_frame = frame
+                self._seg_event.set()
 
     def on_depth_frame(self, data):
         try:
@@ -255,6 +277,114 @@ class FrameProcessor:
             self._depth_map = depth
         except Exception as e:
             print(f"Depth decode error: {e}")
+
+    def on_pointcloud_frame(self, data):
+        try:
+            w, h = struct.unpack('<HH', data[:4])
+            raw = zlib.decompress(data[4:])
+            quant = np.frombuffer(raw, dtype=np.int16).reshape((h, w, 3))
+            self._pointcloud = quant.astype(np.float32) / 1000.0
+        except Exception as e:
+            print(f"Pointcloud decode error: {e}")
+
+    def _segmentation_loop(self):
+        min_interval = 0.5
+        while True:
+            self._seg_event.wait()
+            self._seg_event.clear()
+            frame = self._seg_pending_frame
+            if frame is None:
+                continue
+            t0 = time.time()
+            try:
+                self._run_segmentation(frame)
+            except Exception as e:
+                print(f"Segmentation error: {e}")
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def _run_segmentation(self, frame):
+        results = self.seg_model(frame, retina_masks=True, conf=0.4, iou=0.9, verbose=False)
+        if not results or results[0].masks is None:
+            with self._lock:
+                self._segment_masks = []
+                self._segment_info = []
+                self._seg_overlay = None
+            return
+
+        masks = results[0].masks.data.cpu().numpy()
+        fh, fw = frame.shape[:2]
+        depth_map = self._depth_map
+        pointcloud = self._pointcloud
+
+        seg_colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0),
+            (0, 128, 255), (128, 0, 255), (255, 128, 128), (128, 255, 128),
+            (128, 128, 255), (255, 200, 0), (200, 0, 255), (0, 200, 128),
+        ]
+
+        overlay = np.zeros_like(frame)
+        infos = []
+
+        for i, mask in enumerate(masks):
+            mh, mw = mask.shape
+            if mh != fh or mw != fw:
+                mask = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
+            binary = mask > 0.5
+            area = int(binary.sum())
+            if area < 100:
+                continue
+
+            ys, xs = np.where(binary)
+            x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+            cx, cy = int(xs.mean()), int(ys.mean())
+
+            distance_m = None
+            if depth_map is not None:
+                dh, dw = depth_map.shape
+                scale_x, scale_y = dw / fw, dh / fh
+                mask_resized = cv2.resize(
+                    mask, (dw, dh), interpolation=cv2.INTER_NEAREST
+                ) > 0.5
+                depth_vals = depth_map[mask_resized].astype(np.float32)
+                valid = depth_vals[(depth_vals > 0) & (depth_vals < 65535)]
+                if len(valid) > 10:
+                    distance_m = round(float(np.median(valid)) / 1000.0, 2)
+
+            position_3d = None
+            if pointcloud is not None:
+                ph, pw = pointcloud.shape[:2]
+                scale_x_pc, scale_y_pc = pw / fw, ph / fh
+                mask_pc = cv2.resize(
+                    mask, (pw, ph), interpolation=cv2.INTER_NEAREST
+                ) > 0.5
+                pts = pointcloud[mask_pc]
+                finite = np.isfinite(pts).all(axis=1)
+                pts = pts[finite]
+                if len(pts) > 10:
+                    med = np.median(pts, axis=0)
+                    position_3d = [round(float(med[0]), 3),
+                                   round(float(med[1]), 3),
+                                   round(float(med[2]), 3)]
+
+            color = seg_colors[i % len(seg_colors)]
+            overlay[binary] = color
+
+            infos.append({
+                'id': i,
+                'area_px': area,
+                'centroid_2d': [cx, cy],
+                'distance_m': distance_m,
+                'position_3d': position_3d,
+                'bbox': [x1, y1, x2, y2],
+            })
+
+        with self._lock:
+            self._segment_masks = masks
+            self._segment_info = infos
+            self._seg_overlay = overlay
 
     def _detect_loop(self):
         while True:
@@ -349,6 +479,29 @@ class FrameProcessor:
             cv2.putText(annotated, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
 
+        if self.enable_segmentation and self._seg_overlay is not None:
+            seg_overlay = self._seg_overlay
+            if seg_overlay.shape[:2] == annotated.shape[:2]:
+                mask_any = seg_overlay.any(axis=2)
+                annotated[mask_any] = cv2.addWeighted(
+                    annotated, 0.7, seg_overlay, 0.3, 0
+                )[mask_any]
+
+            seg_info = self._segment_info
+            for seg in seg_info:
+                sx, sy = seg['centroid_2d']
+                d = seg['distance_m']
+                label_parts = []
+                if d is not None:
+                    label_parts.append(f"{d:.1f}m")
+                if seg['position_3d']:
+                    px, py, pz = seg['position_3d']
+                    label_parts.append(f"({px:.1f},{py:.1f},{pz:.1f})")
+                if label_parts:
+                    label = " ".join(label_parts)
+                    cv2.putText(annotated, label, (sx - 20, sy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
         self._fps_counter += 1
         if now - self._fps_time >= 1.0:
             self._fps = self._fps_counter / (now - self._fps_time)
@@ -357,8 +510,10 @@ class FrameProcessor:
 
         faces_str = f"Faces: {len(self._cached_face_results)}" if self.enable_faces else "Faces: off"
         depth_str = "Depth: ON" if depth_available else "Depth: waiting..."
-        status = f"FPS: {self._fps:.0f} | Objects: {len(detections)} | {faces_str} | {depth_str}"
-        cv2.putText(annotated, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+        seg_str = f"Segs: {len(self._segment_info)}" if self.enable_segmentation else "Seg: off"
+        pc_str = "PC: ON" if self._pointcloud is not None else "PC: off"
+        status = f"FPS: {self._fps:.0f} | Objects: {len(detections)} | {faces_str} | {depth_str} | {seg_str} | {pc_str}"
+        cv2.putText(annotated, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 2)
 
         with self._lock:
             self.latest_frame = annotated
@@ -452,14 +607,41 @@ class FrameProcessor:
     def get_detection_summary(self):
         with self._lock:
             dets = list(self.latest_detections)
-        if not dets:
-            return ""
+            segs = list(self._segment_info)
         lines = []
-        for d in dets:
-            dist = f"{d['distance_m']:.1f}m away" if d['distance_m'] else "unknown dist"
-            name_str = f" ({d['name']})" if d.get('name') else ""
-            lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist})")
+        if dets:
+            for d in dets:
+                dist = f"{d['distance_m']:.1f}m away" if d['distance_m'] else "unknown dist"
+                name_str = f" ({d['name']})" if d.get('name') else ""
+                lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist})")
+        if segs:
+            lines.append(f"\nScene segments: {len(segs)} regions detected")
+            for s in segs[:10]:
+                dist = f"{s['distance_m']:.1f}m" if s['distance_m'] else "?"
+                pos = ""
+                if s['position_3d']:
+                    px, py, pz = s['position_3d']
+                    pos = f" pos=({px:.1f},{py:.1f},{pz:.1f})"
+                lines.append(f"  seg#{s['id']}: {s['area_px']}px, {dist}{pos}")
+        if not lines:
+            return ""
         return "Detected objects:\n" + "\n".join(lines)
+
+    def get_segmentation_summary(self):
+        with self._lock:
+            segs = list(self._segment_info)
+        if not segs:
+            return ""
+        lines = [f"Scene segmentation: {len(segs)} regions"]
+        for s in segs:
+            dist = f"{s['distance_m']:.1f}m" if s['distance_m'] else "unknown dist"
+            pos = ""
+            if s['position_3d']:
+                px, py, pz = s['position_3d']
+                pos = f", 3D=({px:.1f},{py:.1f},{pz:.1f})"
+            lines.append(f"- Region #{s['id']}: {s['area_px']}px, {dist}{pos}, "
+                         f"center=({s['centroid_2d'][0]},{s['centroid_2d'][1]})")
+        return "\n".join(lines)
 
 
 # ── Remote Robot Controller ──────────────────────────────────────────────────
@@ -1353,6 +1535,13 @@ class WebHandler(BaseHTTPRequestHandler):
             fp = self.frame_processor
             faces = fp.face_cache.list_known() if (fp and fp.face_cache) else []
             self._json_response(faces)
+        elif self.path == '/segmentation':
+            fp = self.frame_processor
+            segs = []
+            if fp:
+                with fp._lock:
+                    segs = list(fp._segment_info)
+            self._json_response(segs)
         elif self.path == '/robot_status':
             robot = self.robot_controller
             connected = robot is not None and robot._ws is not None
@@ -1635,6 +1824,8 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
                     frame_processor.on_video_frame(payload)
                 elif msg_type == MSG_DEPTH:
                     frame_processor.on_depth_frame(payload)
+                elif msg_type == MSG_POINTCLOUD:
+                    frame_processor.on_pointcloud_frame(payload)
                 elif msg_type == MSG_AUDIO_IN:
                     await audio_queue.put(payload)
             # text messages from robot (status, etc.) — currently unused
@@ -1667,9 +1858,11 @@ async def run_server(args):
     enable_faces = (not args.no_faces) and (face_recognition is not None)
     if not enable_faces and face_recognition is None:
         print("Note: face_recognition/dlib not available; running without face recognition.")
+    seg_model = None if args.no_segmentation else args.seg_model
     frame_processor = FrameProcessor(
         model_path=args.model, confidence=args.confidence,
         face_cache=face_cache, enable_faces=enable_faces,
+        seg_model_path=seg_model, enable_segmentation=not args.no_segmentation,
     )
     _frame_processor_ref = frame_processor
 
@@ -1777,6 +1970,10 @@ def main():
     parser.add_argument('--confidence', type=float, default=0.5)
     parser.add_argument('--face-tolerance', type=float, default=0.6)
     parser.add_argument('--no-faces', action='store_true')
+    parser.add_argument('--seg-model', type=str, default='FastSAM-s.pt',
+                        help='FastSAM model (FastSAM-s.pt or FastSAM-x.pt)')
+    parser.add_argument('--no-segmentation', action='store_true',
+                        help='Disable FastSAM scene segmentation')
     parser.add_argument('--follow-distance', type=float, default=1.0)
     parser.add_argument('--audio-source', choices=['local', 'robot'], default='robot',
                         help="'local' = use this machine's mic; 'robot' = stream from robot mic")
@@ -1789,6 +1986,8 @@ def main():
     print("=" * 60)
     print("Remote Robot Server")
     print("  YOLO + Face Recognition + Gemini Live + Robot Control")
+    seg_status = f"FastSAM ({args.seg_model})" if not args.no_segmentation else "disabled"
+    print(f"  Segmentation: {seg_status}")
     print(f"  Audio: {args.audio_source} mic")
     print("=" * 60)
 
