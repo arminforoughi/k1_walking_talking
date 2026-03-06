@@ -76,6 +76,19 @@ python3 gemini_robot_control.py eth0
 | **robot_client.py** | Thin client — runs on the robot, streams video, executes commands |
 | **gemini_robot_control.py** | All-in-one on-robot mode (original, slower) |
 | **gemini_live_camera.py** | Gemini Live camera stream (no robot control) |
+| **stereo_depth.py** | Stereo depth estimation + 3D gradient map from depth or left/right images |
+| **obstacle_map.py** | 2D occupancy grid for obstacle avoidance |
+
+### Stereo depth and 3D gradient map
+
+Depth is provided by **StereoNet** on the robot (`/StereoNetNode/stereonet_depth`). To also get a **3D gradient map** (depth edges, surface normals, or a 2D world grid of gradients for path planning):
+
+- **From existing depth** (e.g. `fp._depth_map` in `server.py` or the camera node):
+  - Use `stereo_depth.get_gradient_map_from_depth(depth)` for image-space gradient magnitude/direction and optional surface normals.
+  - Use `stereo_depth.gradient_map_2d_world(depth, robot_theta)` to rasterize into a 2D world grid (same style as `ObstacleMap`).
+- **From left + right images** (e.g. `/image_left_raw` and `/image_right_raw`): use `stereo_depth.depth_from_stereo(left, right, baseline_m=..., fx=...)` to compute disparity and depth, then pass the result into the gradient helpers.
+
+See docstring and usage block at the bottom of `stereo_depth.py` for code examples. Calibrate camera intrinsics (fx, fy, cx, cy) and baseline for best results.
 
 ## Remote Mode (Recommended)
 

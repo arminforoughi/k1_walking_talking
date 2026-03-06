@@ -44,6 +44,8 @@ try:
 except (ImportError, OSError):
     face_recognition = None  # e.g. dlib wrong arch on Apple Silicon
 
+from stereo_depth import get_gradient_map_from_depth
+
 from google import genai
 from google.genai import types
 
@@ -448,6 +450,55 @@ class FrameProcessor:
             frame = cv2.resize(frame, (int(w * s), int(h * s)))
         _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return base64.b64encode(buf.tobytes()).decode('utf-8')
+
+    def get_depth_gradient_frame(self, max_dim=640):
+        """Build a side-by-side depth + gradient map view for the UI. Returns BGR image or None."""
+        depth = self._depth_map
+        if depth is None:
+            # Placeholder when no depth yet
+            placeholder = np.zeros((120, 400, 3), dtype=np.uint8)
+            placeholder[:] = (40, 40, 40)
+            cv2.putText(placeholder, "Depth: waiting for stream...", (20, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+            return placeholder
+        try:
+            g = get_gradient_map_from_depth(depth, output_normals=False)
+            depth_m = g["depth_m"]
+            grad_mag = g["grad_mag"]
+            # Normalize for display: depth 0–5 m -> colormap, gradient -> colormap
+            depth_display = np.nan_to_num(depth_m, nan=0.0)
+            depth_display = np.clip(depth_display, 0, 5.0)
+            depth_vis = (depth_display / 5.0 * 255).astype(np.uint8)
+            depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+            invalid = (depth_display <= 0) | (depth_display > 5.0)
+            depth_vis[invalid] = 0
+
+            g_max = float(np.nanmax(grad_mag)) if np.any(np.isfinite(grad_mag)) else 1.0
+            if g_max < 1e-6:
+                g_max = 1.0
+            grad_vis = (np.clip(grad_mag / g_max, 0, 1) * 255).astype(np.uint8)
+            grad_vis = cv2.applyColorMap(grad_vis, cv2.COLORMAP_VIRIDIS)
+            grad_vis[invalid] = 0
+
+            # Side by side: [Depth | Gradient], with labels
+            h, w = depth_vis.shape[:2]
+            pad = 8
+            label_h = 28
+            row1 = np.hstack([depth_vis, np.zeros_like(depth_vis), grad_vis])
+            row1 = cv2.copyMakeBorder(row1, label_h, pad, pad, pad, cv2.BORDER_CONSTANT, value=(30, 30, 30))
+            cv2.putText(row1, "Depth (m)", (pad, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            cv2.putText(row1, "3D Gradient (edges)", (w + pad * 2, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+            out = row1
+            if max(out.shape[0], out.shape[1]) > max_dim:
+                s = max_dim / max(out.shape[0], out.shape[1])
+                out = cv2.resize(out, (int(out.shape[1] * s), int(out.shape[0] * s)))
+            return out
+        except Exception as e:
+            print(f"Depth/gradient view error: {e}")
+            ph = np.zeros((120, 400, 3), dtype=np.uint8)
+            ph[:] = (40, 40, 40)
+            cv2.putText(ph, f"Error: {e}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            return ph
 
     def get_detection_summary(self):
         with self._lock:
@@ -1047,13 +1098,21 @@ HTML_PAGE = """<!DOCTYPE html>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; height:100vh; }
-  #left { flex:1; display:flex; align-items:center; justify-content:center; background:#000; min-width:0; }
+  #left { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#000; min-width:0; }
   #left img { max-width:100%; max-height:100%; object-fit:contain; }
+  #view-toolbar { padding:6px 12px; background:#1a1a1a; border-bottom:1px solid #333; display:flex; align-items:center; gap:10px; }
+  #view-toolbar label { font-size:12px; color:#888; }
+  #view-toolbar select { padding:4px 8px; background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:4px; font-size:12px; cursor:pointer; }
   #right { width:420px; display:flex; flex-direction:column; border-left:1px solid #333; }
   #header { padding:12px 16px; border-bottom:1px solid #333; font-size:14px; color:#888; }
   #header span { color:#4CAF50; font-weight:bold; }
-  #controls { padding:8px 16px; border-bottom:1px solid #333; }
-  #controls h3 { font-size:12px; color:#888; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
+  #controls { border-bottom:1px solid #333; }
+  #controls summary { padding:10px 16px; font-size:12px; color:#888; text-transform:uppercase; letter-spacing:1px; cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; background:#1a1a1a; user-select:none; }
+  #controls summary::-webkit-details-marker { display:none; }
+  #controls summary::after { content:'▼'; font-size:10px; color:#666; transition:transform 0.2s; }
+  #controls[open] summary::after { transform:rotate(-180deg); }
+  #controls .controls-inner { padding:8px 16px 12px; border-top:1px solid #222; max-height:280px; overflow-y:auto; }
+  #controls h3 { font-size:11px; color:#666; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
   .btn-row { display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
   .ctrl-btn { padding:6px 12px; border:none; border-radius:6px; cursor:pointer; font-size:12px; font-weight:bold; transition:transform 0.1s; }
   .ctrl-btn:hover { transform:scale(1.05); }
@@ -1079,7 +1138,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .known { padding:3px 8px; margin:2px 0; background:#1a2a2a; border-radius:4px; font-size:13px; display:flex; justify-content:space-between; }
   .known .kname { color:#00BCD4; }
   .known .del-btn { padding:1px 6px; background:#c62828; color:#fff; border:none; border-radius:3px; font-size:11px; cursor:pointer; }
-  #chat { flex:1; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
+  #chat { flex:1; min-height:0; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
   .msg { padding:8px 12px; border-radius:8px; max-width:95%; font-size:14px; line-height:1.4; word-wrap:break-word; }
   .msg.you { background:#1a3a5c; align-self:flex-end; }
   .msg.robot { background:#2d2d2d; align-self:flex-start; }
@@ -1096,11 +1155,16 @@ HTML_PAGE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <div id="left"><img id="feed" src="/frame" alt="Camera"></div>
+  <div id="left">
+    <div id="view-toolbar"><label>View:</label><select id="view-select"><option value="camera">Camera</option><option value="depth_gradient">Depth &amp; 3D Gradient</option></select></div>
+    <img id="feed" src="/frame" alt="Camera">
+  </div>
   <div id="right">
     <div id="header"><span>Gemini Robot Control</span> &mdash; Remote Mode</div>
     <div id="robot-status"><span id="conn-dot" class="disconnected">&#9679;</span> <span id="conn-text">Robot: connecting...</span></div>
-    <div id="controls">
+    <details id="controls">
+      <summary>Commands</summary>
+      <div class="controls-inner">
       <h3>Robot Controls</h3>
       <div class="btn-row">
         <button class="ctrl-btn btn-follow" onclick="cmd('follow')">Follow Me</button>
@@ -1156,7 +1220,8 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-mode" onclick="cmd('turn_right')">Turn R<br><small>E</small></button>
         <button class="ctrl-btn btn-mode" onclick="cmd('turn_around')">Turn 180</button>
       </div>
-    </div>
+      </div>
+    </details>
     <div id="detections"><h3>Detections</h3><div id="det-list">Waiting for robot...</div></div>
     <div id="known-faces"><h3>Known Faces</h3><div id="kf-list">None yet</div></div>
     <div id="chat"></div>
@@ -1164,16 +1229,23 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... speak commands or use buttons above</div>
+    <div id="status"><span class="dot"></span>Listening... speak or type in chat; open Commands for quick actions</div>
   </div>
 <script>
   const img = document.getElementById('feed');
+  const viewSelect = document.getElementById('view-select');
+  function getFrameUrl() {
+    const view = viewSelect ? viewSelect.value : 'camera';
+    if (view === 'depth_gradient') return '/depth_gradient?t=' + Date.now();
+    return '/frame?t=' + Date.now();
+  }
   function refreshFrame() {
     const next = new Image();
     next.onload = () => { img.src = next.src; setTimeout(refreshFrame, 100); };
     next.onerror = () => { setTimeout(refreshFrame, 500); };
-    next.src = '/frame?t=' + Date.now();
+    next.src = getFrameUrl();
   }
+  if (viewSelect) viewSelect.addEventListener('change', function() { img.src = getFrameUrl(); });
   refreshFrame();
 
   async function cmd(action, target) {
@@ -1340,6 +1412,21 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.wfile.write(buf.tobytes())
             else:
                 self.send_error(503, 'No frame')
+        elif self.path.startswith('/depth_gradient'):
+            fp = self.frame_processor
+            if fp:
+                view_frame = fp.get_depth_gradient_frame()
+                if view_frame is not None:
+                    _, buf = cv2.imencode('.jpg', view_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.end_headers()
+                    self.wfile.write(buf.tobytes())
+                else:
+                    self.send_error(503, 'No depth view')
+            else:
+                self.send_error(503, 'No frame processor')
         elif self.path == '/transcript':
             self._json_response(get_transcript())
         elif self.path == '/detections':
