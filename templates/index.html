@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Gemini Robot Control (Remote)</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.150.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; height:100vh; }
+  #left { flex:1; display:flex; flex-direction:column; background:#000; min-width:0; position:relative; }
+  #left img { flex:1; max-width:100%; max-height:100%; object-fit:contain; min-height:0; }
+  #view-toolbar { padding:6px 12px; background:#1a1a1a; border-bottom:1px solid #333; display:flex; align-items:center; gap:10px; flex-shrink:0; z-index:10; }
+  #view-toolbar label { font-size:12px; color:#888; }
+  #view-toolbar select { padding:4px 8px; background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:4px; font-size:12px; cursor:pointer; }
+  #view-toolbar button { padding:4px 10px; background:#c62828; color:#fff; border:none; border-radius:4px; font-size:11px; cursor:pointer; }
+  #view-toolbar button:hover { background:#e53935; }
+  #scene-container { display:none; flex:1; position:relative; min-height:0; align-items:stretch; justify-content:stretch; }
+  #scene-container canvas { display:block; position:absolute; top:0; left:0; width:100%; height:100%; }
+  #scene-stats { position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.8); padding:8px 12px; border-radius:8px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.7; max-width:260px; }
+  #scene-stats .stat-label { color:#666; }
+  #scene-stats .stat-val { color:#eee; font-weight:bold; }
+  #scene-legend { position:absolute; bottom:8px; left:8px; background:rgba(0,0,0,0.8); padding:8px 12px; border-radius:8px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.8; }
+  .legend-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+  #right { width:420px; display:flex; flex-direction:column; border-left:1px solid #333; min-height:0; }
+  #header { padding:10px 16px; border-bottom:1px solid #333; font-size:14px; color:#888; flex-shrink:0; }
+  #header span { color:#4CAF50; font-weight:bold; }
+  #controls { border-bottom:1px solid #333; }
+  .controls-toggle { width:100%; padding:8px 16px; text-align:left; background:#1a1a1a; color:#888; border:none; cursor:pointer; font-size:12px; font-weight:bold; text-transform:uppercase; letter-spacing:1px; display:flex; align-items:center; justify-content:space-between; }
+  .controls-toggle:hover { background:#222; color:#ccc; }
+  .controls-content { display:none; padding:8px 16px; border-top:1px solid #222; max-height:50vh; overflow-y:auto; }
+  #controls.open .controls-content { display:block; }
+  #controls .controls-toggle .arrow { transition:transform 0.2s; }
+  #controls.open .controls-toggle .arrow { transform:rotate(180deg); }
+  #controls h3 { font-size:12px; color:#888; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
+  .btn-row { display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
+  .ctrl-btn { padding:6px 12px; border:none; border-radius:6px; cursor:pointer; font-size:12px; font-weight:bold; transition:transform 0.1s; }
+  .ctrl-btn:hover { transform:scale(1.05); }
+  .ctrl-btn:active { transform:scale(0.95); }
+  .btn-follow { background:#4CAF50; color:#000; }
+  .btn-dance { background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; }
+  .btn-action { background:#2196F3; color:#fff; }
+  .btn-head { background:#43e97b; color:#000; }
+  .btn-stop { background:#f44336; color:#fff; }
+  .btn-mode { background:#FF9800; color:#000; }
+  #robot-status { padding:6px 16px; border-bottom:1px solid #333; font-size:12px; }
+  .connected { color:#4CAF50; } .disconnected { color:#f44336; }
+  #detections { padding:8px 16px; border-bottom:1px solid #333; max-height:120px; overflow-y:auto; }
+  #detections h3 { font-size:12px; color:#888; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
+  .det { padding:4px 8px; margin:3px 0; background:#1a2a1a; border-radius:4px; font-size:13px; display:flex; justify-content:space-between; }
+  .det .cls { color:#4CAF50; } .det .name { color:#00BCD4; font-weight:bold; }
+  .det .unknown { color:#FF9800; } .det .dist { color:#2196F3; font-weight:bold; }
+  .det .conf { color:#666; font-size:11px; }
+  .det .name-input { width:80px; padding:2px 4px; background:#222; border:1px solid #555; color:#eee; border-radius:3px; font-size:12px; }
+  .det .save-btn { padding:2px 8px; background:#4CAF50; color:#000; border:none; border-radius:3px; font-size:11px; cursor:pointer; margin-left:4px; }
+  #known-faces { padding:8px 16px; border-bottom:1px solid #333; max-height:80px; overflow-y:auto; }
+  #known-faces h3 { font-size:12px; color:#888; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
+  .known { padding:3px 8px; margin:2px 0; background:#1a2a2a; border-radius:4px; font-size:13px; display:flex; justify-content:space-between; }
+  .known .kname { color:#00BCD4; }
+  .known .del-btn { padding:1px 6px; background:#c62828; color:#fff; border:none; border-radius:3px; font-size:11px; cursor:pointer; }
+  #chat { flex:1; min-height:0; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
+  .msg { padding:8px 12px; border-radius:8px; max-width:95%; font-size:14px; line-height:1.4; word-wrap:break-word; }
+  .msg.you { background:#1a3a5c; align-self:flex-end; }
+  .msg.robot { background:#2d2d2d; align-self:flex-start; }
+  .msg.system { background:#2a2a1a; align-self:center; font-size:12px; color:#aaa; }
+  .msg.action { background:#1a2a1a; align-self:center; font-size:12px; color:#4CAF50; border:1px solid #4CAF50; }
+  .msg .role { font-size:11px; color:#888; margin-bottom:2px; }
+  #chat-input { display:flex; padding:8px 12px; border-top:1px solid #333; gap:6px; }
+  #msg-input { flex:1; padding:8px 12px; background:#1a1a1a; border:1px solid #444; color:#eee; border-radius:8px; font-size:14px; outline:none; }
+  #msg-input:focus { border-color:#4CAF50; }
+  #send-btn { padding:8px 16px; background:#4CAF50; color:#000; border:none; border-radius:8px; font-weight:bold; cursor:pointer; font-size:14px; }
+  #send-btn:hover { background:#66BB6A; }
+  #status { padding:8px 16px; border-top:1px solid #333; font-size:12px; color:#666; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#4CAF50; margin-right:6px; }
+</style>
+</head>
+<body>
+  <div id="left">
+    <div id="view-toolbar">
+      <label>View:</label>
+      <select id="view-select">
+        <option value="camera">Camera</option>
+        <option value="depth_gradient">Depth &amp; Gradient</option>
+        <option value="3d_scene">3D Scene</option>
+      </select>
+      <button id="scene-clear-btn" style="display:none" onclick="clearScene()">Reset Scene</button>
+    </div>
+    <img id="feed" src="/frame" alt="Camera">
+    <div id="scene-container">
+      <canvas id="scene3d"></canvas>
+      <div id="scene-stats">Waiting for data...</div>
+      <div id="scene-legend"></div>
+    </div>
+  </div>
+  <div id="right">
+    <div id="header"><span>Gemini Robot Control</span> &mdash; Remote Mode</div>
+    <div id="robot-status"><span id="conn-dot" class="disconnected">&#9679;</span> <span id="conn-text">Robot: connecting...</span></div>
+    <div id="controls">
+      <button type="button" class="controls-toggle" id="controls-toggle" aria-expanded="false">
+        Commands <span class="arrow">&#9660;</span>
+      </button>
+      <div class="controls-content">
+      <h3>Robot Controls</h3>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-follow" onclick="cmd('follow')">Follow Me</button>
+        <button class="ctrl-btn btn-follow" onclick="cmd('track')">Track Person</button>
+        <button class="ctrl-btn btn-follow" onclick="goToPrompt()">Go To...</button>
+        <button class="ctrl-btn btn-stop" onclick="cmd('stop')">STOP ALL</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance')">Dance</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_newyear')">New Year</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_nezha')">Nezha</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_future')">Future</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_moonwalk')">Moonwalk</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_michael jackson')">MJ Dance</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_kick')">Kick</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_roundhouse')">Roundhouse</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_salsa')">Salsa</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_ultraman')">Ultraman</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_respect')">Respect</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_celebrate')">Celebrate</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_luckycat')">Lucky Cat</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_macarena')">Macarena</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_twist')">Twist</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_disco')">Disco</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_chicken')">Chicken</button>
+        <button class="ctrl-btn btn-dance" onclick="cmd('dance_bow')">Bow</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-action" onclick="cmd('wave')">Wave</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('handshake')">Handshake</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('dab')">Dab</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('flex')">Flex</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('nod')">Nod</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('head_shake')">Shake Head</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-head" onclick="cmd('look_up')">Look Up</button>
+        <button class="ctrl-btn btn-head" onclick="cmd('look_down')">Look Down</button>
+        <button class="ctrl-btn btn-head" onclick="cmd('look_left')">Look Left</button>
+        <button class="ctrl-btn btn-head" onclick="cmd('look_right')">Look Right</button>
+        <button class="ctrl-btn btn-head" onclick="cmd('look_center')">Center</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-mode" onclick="cmd('forward')">Forward<br><small>W</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('backward')">Backward<br><small>S</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('strafe_left')">Strafe L<br><small>A</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('strafe_right')">Strafe R<br><small>D</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('turn_left')">Turn L<br><small>Q</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('turn_right')">Turn R<br><small>E</small></button>
+        <button class="ctrl-btn btn-mode" onclick="cmd('turn_around')">Turn 180</button>
+      </div>
+      </div>
+    </div>
+    <div id="detections"><h3>Detections</h3><div id="det-list">Waiting for robot...</div></div>
+    <div id="known-faces"><h3>Known Faces</h3><div id="kf-list">None yet</div></div>
+    <div id="chat"></div>
+    <div id="chat-input">
+      <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
+      <button id="send-btn" onclick="sendChat()">Send</button>
+    </div>
+    <div id="status"><span class="dot"></span>Listening... speak or type in chat; open Commands for quick actions</div>
+  </div>
+<script>
+  const img = document.getElementById('feed');
+  const viewSelect = document.getElementById('view-select');
+  const sceneClearBtn = document.getElementById('scene-clear-btn');
+  const sceneContainer = document.getElementById('scene-container');
+  window.framePolling = true;
+
+  (function() {
+    const controlsEl = document.getElementById('controls');
+    const toggleBtn = document.getElementById('controls-toggle');
+    if (controlsEl && toggleBtn) {
+      toggleBtn.addEventListener('click', function() {
+        const open = controlsEl.classList.toggle('open');
+        toggleBtn.setAttribute('aria-expanded', open);
+      });
+    }
+  })();
+
+  function getFrameUrl() {
+    const v = viewSelect.value;
+    if (v === 'depth_gradient') return '/depth_gradient?t=' + Date.now();
+    return '/frame?t=' + Date.now();
+  }
+  function refreshFrame() {
+    if (!window.framePolling) { setTimeout(refreshFrame, 200); return; }
+    const next = new Image();
+    next.onload = () => { img.src = next.src; setTimeout(refreshFrame, 100); };
+    next.onerror = () => { setTimeout(refreshFrame, 500); };
+    next.src = getFrameUrl();
+  }
+  refreshFrame();
+
+  async function cmd(action, target) {
+    try {
+      const payload = {action};
+      if (target) payload.target = target;
+      const r = await fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      console.log('cmd:', await r.json());
+    } catch(e) { console.error(e); }
+  }
+
+  function goToPrompt() {
+    const target = prompt('Go to what? (e.g. person, chair, bottle, backpack, a name)');
+    if (!target || !target.trim()) return;
+    const distStr = prompt('Stop distance in meters? (default 0.5)', '0.5');
+    const dist = parseFloat(distStr) || 0.5;
+    fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'go_to', target:target.trim(), distance:dist})
+    }).then(r=>r.json()).then(d=>console.log('go_to:',d)).catch(console.error);
+  }
+
+  async function sendChat() {
+    const input = document.getElementById('msg-input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    try { await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})}); } catch(e) { console.error(e); }
+  }
+  document.getElementById('msg-input').addEventListener('keydown', function(e) { if (e.key==='Enter') { e.preventDefault(); sendChat(); } });
+
+  const wasdMap = {w:'forward', s:'backward', a:'strafe_left', d:'strafe_right', q:'turn_left', e:'turn_right'};
+  document.addEventListener('keydown', function(e) {
+    if (document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA') return;
+    const action = wasdMap[e.key.toLowerCase()];
+    if (action) { e.preventDefault(); cmd(action); }
+  });
+
+  async function clearScene() {
+    try { await fetch('/scene_clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch(e) {}
+  }
+
+  async function saveFace(unknownId) {
+    const input = document.getElementById('ni_'+unknownId);
+    if (!input||!input.value.trim()) return;
+    try { await fetch('/save_face', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({unknown_id:unknownId, name:input.value.trim()})}); } catch(e) { console.error(e); }
+  }
+
+  async function deleteFace(name) {
+    if (!confirm('Delete face: '+name+'?')) return;
+    try { await fetch('/delete_face', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})}); } catch(e) { console.error(e); }
+  }
+
+  const chat = document.getElementById('chat');
+  let lastLen = 0;
+  async function pollTranscript() {
+    try {
+      const r = await fetch('/transcript');
+      const msgs = await r.json();
+      if (msgs.length !== lastLen) {
+        lastLen = msgs.length;
+        chat.innerHTML = msgs.map(m => {
+          const cls = m.role==='You'?'you':m.role==='Action'?'action':m.role==='System'?'system':'robot';
+          return '<div class="msg '+cls+'"><div class="role">'+m.role+'</div>'+m.text+'</div>';
+        }).join('');
+        chat.scrollTop = chat.scrollHeight;
+      }
+    } catch(e) {}
+    setTimeout(pollTranscript, 500);
+  }
+  pollTranscript();
+
+  const detList = document.getElementById('det-list');
+  async function pollDetections() {
+    try {
+      const r = await fetch('/detections');
+      const dets = await r.json();
+      if (dets.length === 0) {
+        detList.innerHTML = '<div style="color:#666;font-size:12px;">No objects detected</div>';
+      } else {
+        detList.innerHTML = dets.map(d => {
+          const dist = d.distance_m !== null ? d.distance_m.toFixed(1)+'m' : '?';
+          let nameHtml = '';
+          if (d.class==='person' && d.name) {
+            if (d.unknown_id !== null && d.unknown_id !== undefined) {
+              nameHtml = '<span class="unknown">'+d.name+'</span> '
+                +'<input class="name-input" placeholder="Name..." id="ni_'+d.unknown_id+'">'
+                +'<button class="save-btn" onclick="saveFace('+d.unknown_id+')">Save</button>';
+            } else {
+              nameHtml = '<span class="name">'+d.name+'</span> ';
+            }
+          }
+          return '<div class="det"><span>'+nameHtml+'<span class="cls">'+d.class+'</span> <span class="conf">'+(d.confidence*100).toFixed(0)+'%</span></span><span class="dist">'+dist+'</span></div>';
+        }).join('');
+      }
+    } catch(e) {}
+    setTimeout(pollDetections, 300);
+  }
+  pollDetections();
+
+  const kfList = document.getElementById('kf-list');
+  async function pollKnownFaces() {
+    try {
+      const r = await fetch('/known_faces');
+      const faces = await r.json();
+      if (faces.length===0) {
+        kfList.innerHTML = '<div style="color:#666;font-size:12px;">No saved faces</div>';
+      } else {
+        kfList.innerHTML = faces.map(f =>
+          '<div class="known"><span class="kname">'+f.name+'</span><button class="del-btn" onclick="deleteFace(\''+f.name+'\')">x</button></div>'
+        ).join('');
+      }
+    } catch(e) {}
+    setTimeout(pollKnownFaces, 2000);
+  }
+  pollKnownFaces();
+
+  async function pollRobotStatus() {
+    try {
+      const r = await fetch('/robot_status');
+      const s = await r.json();
+      document.getElementById('conn-dot').className = s.connected ? 'connected' : 'disconnected';
+      document.getElementById('conn-text').textContent = s.connected ? 'Robot: connected' : 'Robot: disconnected';
+    } catch(e) {}
+    setTimeout(pollRobotStatus, 2000);
+  }
+  pollRobotStatus();
+</script>
+
+<script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+  let scene3d, renderer3d, camera3d, controls3d;
+  let pointCloud, robotGroup, trailLine;
+  let objMarkers = [];
+  let scene3dReady = false, scene3dPolling = false;
+  const sceneContainer = document.getElementById('scene-container');
+  const legendEl = document.getElementById('scene-legend');
+
+  function initScene3D() {
+    if (scene3dReady) return;
+    const canvas = document.getElementById('scene3d');
+
+    scene3d = new THREE.Scene();
+    scene3d.background = new THREE.Color(0x0d0d14);
+    scene3d.fog = new THREE.FogExp2(0x0d0d14, 0.012);
+
+    camera3d = new THREE.PerspectiveCamera(60, 1, 0.1, 200);
+    camera3d.position.set(-3, 8, -5);
+    camera3d.lookAt(0, 0, 0);
+
+    renderer3d = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    controls3d = new OrbitControls(camera3d, renderer3d.domElement);
+    controls3d.enableDamping = true;
+    controls3d.dampingFactor = 0.1;
+    controls3d.maxPolarAngle = Math.PI * 0.85;
+    controls3d.minDistance = 1;
+    controls3d.maxDistance = 60;
+
+    const grid = new THREE.GridHelper(40, 80, 0x1a3a1a, 0x121818);
+    scene3d.add(grid);
+
+    const axes = new THREE.AxesHelper(1.5);
+    scene3d.add(axes);
+
+    scene3d.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.3);
+    dirLight.position.set(5, 10, -5);
+    scene3d.add(dirLight);
+
+    const pcGeo = new THREE.BufferGeometry();
+    pcGeo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    pcGeo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
+    const pcMat = new THREE.PointsMaterial({
+      size: 0.04, vertexColors: true, sizeAttenuation: true,
+      transparent: true, opacity: 0.9,
+    });
+    pointCloud = new THREE.Points(pcGeo, pcMat);
+    scene3d.add(pointCloud);
+
+    robotGroup = new THREE.Group();
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(0.14, 0.4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x4CAF50, emissive: 0x2a7a2a })
+    );
+    cone.rotation.z = -Math.PI / 2;
+    cone.position.x = 0.18;
+    robotGroup.add(cone);
+    const body = new THREE.Mesh(
+      new THREE.SphereGeometry(0.14, 12, 8),
+      new THREE.MeshStandardMaterial({ color: 0x66BB6A, emissive: 0x336636 })
+    );
+    robotGroup.add(body);
+    robotGroup.position.y = 0.25;
+    scene3d.add(robotGroup);
+
+    const trailGeo = new THREE.BufferGeometry();
+    trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    const trailMat = new THREE.LineBasicMaterial({ color: 0x4CAF50, opacity: 0.4, transparent: true });
+    trailLine = new THREE.Line(trailGeo, trailMat);
+    scene3d.add(trailLine);
+
+    scene3dReady = true;
+    animate3D();
+  }
+
+  function resizeScene() {
+    if (!scene3dReady) return;
+    const w = sceneContainer.clientWidth || sceneContainer.offsetWidth || 800;
+    const h = sceneContainer.clientHeight || sceneContainer.offsetHeight || 600;
+    if (w < 10 || h < 10) return;
+    renderer3d.setSize(w, h);
+    camera3d.aspect = w / h;
+    camera3d.updateProjectionMatrix();
+    renderer3d.render(scene3d, camera3d);
+  }
+  window.addEventListener('resize', resizeScene);
+
+  function animate3D() {
+    if (!scene3dReady) return;
+    requestAnimationFrame(animate3D);
+    controls3d.update();
+    renderer3d.render(scene3d, camera3d);
+  }
+
+  function makeLabel(text, bgColor) {
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    c.width = 256; c.height = 64;
+    const r = (bgColor >> 16) & 0xff, g = (bgColor >> 8) & 0xff, b = bgColor & 0xff;
+    ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
+    ctx.beginPath();
+    ctx.roundRect(4, 4, 248, 56, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text.substring(0, 22), 128, 32);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(1.3, 0.32, 1);
+    return sprite;
+  }
+
+  function colorToHex(arr) {
+    const ri = Math.round(arr[0] * 255), gi = Math.round(arr[1] * 255), bi = Math.round(arr[2] * 255);
+    return (ri << 16) | (gi << 8) | bi;
+  }
+
+  function updateScene3D(data) {
+    if (!scene3dReady) return;
+
+    if (data.points.count > 0) {
+      const pos = new Float32Array(data.points.positions);
+      const col = new Float32Array(data.points.colors);
+      pointCloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      pointCloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+      pointCloud.geometry.computeBoundingSphere();
+    }
+
+    const rb = data.robot;
+    robotGroup.position.set(rb.x, 0.25, rb.z);
+    robotGroup.rotation.y = -rb.theta;
+
+    if (data.trajectory.length >= 6) {
+      trailLine.geometry.setAttribute('position',
+        new THREE.Float32BufferAttribute(new Float32Array(data.trajectory), 3));
+      trailLine.geometry.computeBoundingSphere();
+    }
+
+    for (const m of objMarkers) {
+      scene3d.remove(m);
+      m.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (child.material.map) child.material.map.dispose();
+          child.material.dispose();
+        }
+      });
+    }
+    objMarkers = [];
+
+    const legendLabels = {};
+
+    for (const obj of data.objects) {
+      const g = new THREE.Group();
+      const hex = colorToHex(obj.color);
+
+      const sx = obj.sx || 0.3;
+      const sy = obj.sy || 0.3;
+      const sz = obj.sz || 0.3;
+
+      const wire = new THREE.Mesh(
+        new THREE.BoxGeometry(sx, sy, sz),
+        new THREE.MeshBasicMaterial({ color: hex, wireframe: true, transparent: true, opacity: 0.8 })
+      );
+      g.add(wire);
+
+      const solid = new THREE.Mesh(
+        new THREE.BoxGeometry(sx * 0.98, sy * 0.98, sz * 0.98),
+        new THREE.MeshStandardMaterial({ color: hex, transparent: true, opacity: 0.18, emissive: hex, emissiveIntensity: 0.3 })
+      );
+      g.add(solid);
+
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(sx, sy, sz)),
+        new THREE.LineBasicMaterial({ color: hex, linewidth: 2 })
+      );
+      g.add(edges);
+
+      const label = makeLabel(obj.label, hex);
+      label.position.y = sy / 2 + 0.35;
+      g.add(label);
+
+      if (obj.point_count > 0) {
+        const ptLabel = makeLabel(obj.point_count + ' pts', 0x333333);
+        ptLabel.position.y = sy / 2 + 0.65;
+        ptLabel.scale.set(0.8, 0.2, 1);
+        g.add(ptLabel);
+      }
+
+      g.position.set(obj.x, Math.max(obj.y, 0) + sy / 2, obj.z);
+      scene3d.add(g);
+      objMarkers.push(g);
+
+      legendLabels[obj.label] = obj.color;
+    }
+
+    const stats = document.getElementById('scene-stats');
+    if (stats) {
+      const cc = data.class_counts || {};
+      const structPts = cc['_structure'] || 0;
+      const objPts = cc['_object'] || 0;
+      stats.innerHTML =
+        '<span class="stat-label">Points:</span> <span class="stat-val">' + data.points.count.toLocaleString() + '</span>' +
+        ' <span style="color:#555">(obj: ' + objPts.toLocaleString() + ' / struct: ' + structPts.toLocaleString() + ')</span>' +
+        '<br><span class="stat-label">Objects:</span> <span class="stat-val">' + data.objects.length + '</span>' +
+        '<br><span class="stat-label">Robot:</span> (' + rb.x.toFixed(1) + ', ' + rb.z.toFixed(1) + ')' +
+        ' &theta;=' + (rb.theta * 180 / Math.PI).toFixed(0) + '&deg;';
+    }
+
+    if (legendEl) {
+      const entries = Object.entries(legendLabels);
+      if (entries.length > 0) {
+        legendEl.innerHTML = entries.map(([name, c]) => {
+          const hex = '#' + colorToHex(c).toString(16).padStart(6, '0');
+          return '<span class="legend-dot" style="background:' + hex + '"></span>' + name;
+        }).join('&nbsp;&nbsp; ');
+      } else {
+        legendEl.innerHTML = '';
+      }
+    }
+  }
+
+  async function pollScene() {
+    if (!scene3dPolling) return;
+    try {
+      const r = await fetch('/scene_data');
+      const data = await r.json();
+      updateScene3D(data);
+    } catch(e) { console.error('scene poll:', e); }
+    if (scene3dPolling) setTimeout(pollScene, 500);
+  }
+
+  const viewSelect = document.getElementById('view-select');
+  viewSelect.addEventListener('change', function() {
+    const v = viewSelect.value;
+    const feed = document.getElementById('feed');
+    if (v === '3d_scene') {
+      feed.style.display = 'none';
+      sceneContainer.style.display = 'flex';
+      document.getElementById('scene-clear-btn').style.display = '';
+      window.framePolling = false;
+      initScene3D();
+      requestAnimationFrame(() => { requestAnimationFrame(() => { resizeScene(); }); });
+      scene3dPolling = true;
+      pollScene();
+    } else {
+      feed.style.display = '';
+      sceneContainer.style.display = 'none';
+      document.getElementById('scene-clear-btn').style.display = 'none';
+      scene3dPolling = false;
+      window.framePolling = true;
+    }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "voxel_size": 0.05,
+  "grid_size": 128,
+  "integrate_count": 1984
+}
