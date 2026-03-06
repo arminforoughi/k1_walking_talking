@@ -22,6 +22,12 @@ import re
 from stereo_depth import get_gradient_map_from_depth
 from scene_reconstructor import SceneReconstructor
 
+try:
+    from depth_model import DepthEstimator
+    _depth_model_available = True
+except ImportError:
+    _depth_model_available = False
+
 # Detection colors (BGR)
 _COLORS = [
     (0, 255, 0), (255, 128, 0), (0, 128, 255), (255, 0, 255),
@@ -151,6 +157,17 @@ class FrameProcessor:
         self._fps_time = time.time()
 
         self.scene_reconstructor = SceneReconstructor()
+
+        self._depth_estimator = None
+        self._metric_depth = None
+        self._depth_model_interval = 0.5
+        self._last_depth_model_time = 0.0
+        if _depth_model_available:
+            try:
+                self._depth_estimator = DepthEstimator()
+                self._depth_estimator.load_async()
+            except Exception as e:
+                print(f"[DepthModel] Init failed: {e}")
 
         self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self._pending_frame = None
@@ -313,11 +330,31 @@ class FrameProcessor:
             self.latest_frame = annotated
             self.latest_detections = detections
 
+        depth_to_use = self._depth_map
+        depth_is_meters = False
+        if (self._depth_estimator and self._depth_estimator.is_ready
+                and self._depth_map is not None
+                and now - self._last_depth_model_time >= self._depth_model_interval):
+            self._last_depth_model_time = now
+            try:
+                dh, dw = self._depth_map.shape
+                mono = self._depth_estimator.predict(frame, target_h=dh, target_w=dw)
+                if mono is not None:
+                    self._metric_depth = self._depth_estimator.align_to_metric(
+                        mono, self._depth_map)
+            except Exception as e:
+                print(f"[DepthModel] Predict error: {e}")
+
+        if self._metric_depth is not None:
+            depth_to_use = self._metric_depth
+            depth_is_meters = True
+
         if self.scene_reconstructor:
             self.scene_reconstructor.process_frame(
-                self._depth_map, detections, self._frame_shape,
+                depth_to_use, detections, self._frame_shape,
                 seg_instance_map=seg_instance_map if has_masks else None,
                 instance_info=instance_info if has_masks else None,
+                depth_is_meters=depth_is_meters,
             )
 
     def _run_face_recognition(self, frame):
