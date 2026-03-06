@@ -52,6 +52,7 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03
+MSG_VIDEO_RIGHT = 0x04
 # server -> robot
 MSG_AUDIO_OUT = 0x10
 
@@ -183,11 +184,16 @@ class WebHandler(BaseHTTPRequestHandler):
         elif self.path == '/scene_data':
             fp = self.frame_processor
             if fp and fp.scene_reconstructor:
-                self._json_response(fp.scene_reconstructor.get_scene_data())
+                scene_data = fp.scene_reconstructor.get_scene_data()
+                if hasattr(fp, '_scene_graph') and fp._scene_graph:
+                    tracked = fp.scene_reconstructor.get_tracked_objects()
+                    fp._scene_graph.update_from_objects(tracked)
+                    scene_data['scene_graph'] = fp._scene_graph.get_graph_data()
+                self._json_response(scene_data)
             else:
                 self._json_response({'robot': {'x': 0, 'y': 0, 'z': 0, 'theta': 0},
                                      'trajectory': [], 'objects': [],
-                                     'points': {'positions': [], 'colors': [], 'count': 0}})
+                                     'splats': {'positions': [], 'colors': [], 'opacities': [], 'scales': [], 'count': 0}})
         else:
             self.send_error(404)
 
@@ -468,6 +474,8 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
                 payload = message[1:]
                 if msg_type == MSG_VIDEO:
                     frame_processor.on_video_frame(payload)
+                elif msg_type == MSG_VIDEO_RIGHT:
+                    frame_processor.on_video_frame_right(payload)
                 elif msg_type == MSG_DEPTH:
                     frame_processor.on_depth_frame(payload)
                 elif msg_type == MSG_AUDIO_IN:
@@ -501,11 +509,46 @@ async def run_server(args):
     enable_faces = (not args.no_faces) and (face_recognition is not None)
     if not enable_faces and face_recognition is None:
         print("Note: face_recognition/dlib not available; running without face recognition.")
+
+    depth_estimator = None
+    if args.depth_model:
+        try:
+            from depth_model import DepthEstimator
+            depth_estimator = DepthEstimator(model_size=args.depth_model)
+            print(f"Neural depth: Depth Anything V2 ({args.depth_model}) — loading in background...")
+        except Exception as e:
+            print(f"Warning: failed to init depth model: {e}")
+
+    sam2_segmenter = None
+    if args.sam2:
+        try:
+            from sam2_segmenter import SAM2Segmenter
+            sam2_segmenter = SAM2Segmenter()
+            print("SAM2: hiera-tiny — loading in background...")
+        except Exception as e:
+            print(f"Warning: failed to init SAM2: {e}")
+
+    dust3r_reconstructor = None
+    if args.dust3r:
+        try:
+            from dust3r_reconstructor import DUSt3RReconstructor
+            dust3r_reconstructor = DUSt3RReconstructor()
+            print("DUSt3R: ViTLarge — loading in background...")
+        except Exception as e:
+            print(f"Warning: failed to init DUSt3R: {e}")
+
+    from scene_graph import SceneGraph
+    scene_graph = SceneGraph()
+
     frame_processor = FrameProcessor(
         model_path=args.model, confidence=args.confidence,
         face_cache=face_cache, enable_faces=enable_faces,
         on_transcript=add_transcript,
+        depth_estimator=depth_estimator,
+        sam2_segmenter=sam2_segmenter,
+        dust3r_reconstructor=dust3r_reconstructor,
     )
+    frame_processor._scene_graph = scene_graph
     _frame_processor_ref = frame_processor
 
     robot = RobotController()
@@ -606,7 +649,7 @@ def main():
     parser.add_argument('--port', type=int, default=8080, help='Web UI port')
     parser.add_argument('--ws-port', type=int, default=9090,
                         help='WebSocket port for robot connection')
-    parser.add_argument('--model', type=str, default='yolov8n-seg.pt', help='YOLO model')
+    parser.add_argument('--model', type=str, default='yolov8m-seg.pt', help='YOLO model (m=medium, l=large, x=xlarge for better quality)')
     parser.add_argument('--confidence', type=float, default=0.5)
     parser.add_argument('--face-tolerance', type=float, default=0.6)
     parser.add_argument('--no-faces', action='store_true')
@@ -617,12 +660,32 @@ def main():
                         help='Mic gain (only for --audio-source local)')
     parser.add_argument('--mic-device', type=int, default=None,
                         help='PyAudio mic device (only for --audio-source local)')
+    parser.add_argument('--depth-model', type=str, default=None,
+                        choices=['small', 'base', 'large'],
+                        help='Enable neural depth (Depth Anything V2): small/base/large')
+    parser.add_argument('--sam2', action='store_true', default=False,
+                        help='Enable SAM2 instance segmentation (replaces YOLO-seg masks)')
+    parser.add_argument('--no-sam2', action='store_true', default=False,
+                        help='Disable SAM2 even if installed')
+    parser.add_argument('--dust3r', action='store_true', default=False,
+                        help='Enable DUSt3R dense stereo 3D reconstruction')
+    parser.add_argument('--no-dust3r', action='store_true', default=False,
+                        help='Disable DUSt3R even if installed')
     args = parser.parse_args()
 
+    if args.no_sam2:
+        args.sam2 = False
+    if args.no_dust3r:
+        args.dust3r = False
+
     print("=" * 60)
-    print("Remote Robot Server")
-    print("  YOLO + Face Recognition + Gemini Live + Robot Control")
+    print("Remote Robot Server — Full 3D Pipeline")
     print(f"  Audio: {args.audio_source} mic")
+    print(f"  YOLO:      {args.model}")
+    print(f"  SAM2:      {'ON' if args.sam2 else 'off (--sam2 to enable)'}")
+    print(f"  Depth:     {args.depth_model or 'off (--depth-model small/base/large)'}")
+    print(f"  DUSt3R:    {'ON' if args.dust3r else 'off (--dust3r to enable)'}")
+    print(f"  Renderer:  Gaussian Splats + Scene Graph")
     print("=" * 60)
 
     try:

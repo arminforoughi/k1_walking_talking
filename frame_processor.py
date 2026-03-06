@@ -125,14 +125,20 @@ class FaceCache:
 class FrameProcessor:
     """Receives frames from robot WebSocket, runs YOLO + face recognition."""
 
-    def __init__(self, model_path='yolov8n-seg.pt', confidence=0.5,
-                 face_cache=None, enable_faces=True, on_transcript=None):
+    def __init__(self, model_path='yolov8m-seg.pt', confidence=0.5,
+                 face_cache=None, enable_faces=True, on_transcript=None,
+                 depth_estimator=None, sam2_segmenter=None,
+                 dust3r_reconstructor=None):
         print(f'Loading YOLO model: {model_path}')
         self.model = YOLO(model_path)
         self.confidence = confidence
         self.enable_faces = enable_faces
         self.face_cache = face_cache
         self._on_transcript = on_transcript
+        self.depth_estimator = depth_estimator
+        self.sam2_segmenter = sam2_segmenter
+        self.dust3r_reconstructor = dust3r_reconstructor
+        self._dust3r_frame_count = 0
 
         self._unknown_faces = {}
         self._next_unknown_id = 1
@@ -143,8 +149,10 @@ class FrameProcessor:
         self._lock = threading.Lock()
         self.latest_frame = None       # annotated frame (for web UI)
         self.latest_detections = []
-        self._raw_frame = None         # original decoded frame
+        self._raw_frame = None         # left camera (original decoded)
+        self._raw_frame_right = None   # right camera for DUSt3R stereo
         self._depth_map = None        # uint16 depth
+        self._depth_map_enhanced = None  # neural-enhanced depth
         self._frame_shape = None      # (h, w)
         self._fps = 0.0
         self._fps_counter = 0
@@ -164,6 +172,11 @@ class FrameProcessor:
             self._frame_shape = frame.shape[:2]
             self._pending_frame = frame
             self._detect_event.set()
+
+    def on_video_frame_right(self, jpeg_bytes):
+        frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            self._raw_frame_right = frame
 
     def on_depth_frame(self, data):
         try:
@@ -216,11 +229,13 @@ class FrameProcessor:
         instance_info = []
         has_masks = False
 
+        yolo_boxes = []
+        yolo_cls_ids = []
+        yolo_masks_data = None
+
         for result in results:
-            masks_data = None
             if hasattr(result, 'masks') and result.masks is not None:
-                masks_data = result.masks.data.cpu().numpy()
-                has_masks = True
+                yolo_masks_data = result.masks.data.cpu().numpy()
 
             for i, box in enumerate(result.boxes):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
@@ -238,26 +253,49 @@ class FrameProcessor:
                     'center': [int(cx), int(cy)],
                     'name': None, 'unknown_id': None,
                 })
+                yolo_boxes.append([int(x1), int(y1), int(x2), int(y2)])
+                yolo_cls_ids.append(cls_id)
 
-                if masks_data is not None and i < len(masks_data):
-                    mask_resized = cv2.resize(
-                        masks_data[i], (w, h), interpolation=cv2.INTER_NEAREST
-                    )
-                    mask_bool = mask_resized > 0.5
-                    inst_id = len(instance_info)
-                    seg_instance_map[mask_bool] = inst_id
-                    instance_info.append({'cls_id': cls_id, 'cls_name': cls_name})
+        use_sam2 = (self.sam2_segmenter is not None and self.sam2_segmenter.ready
+                    and len(yolo_boxes) > 0)
+        sam2_masks = None
+        sam2_str = ""
+        if use_sam2:
+            t0 = time.time()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            sam2_masks = self.sam2_segmenter.segment_from_boxes(rgb, yolo_boxes)
+            sam2_str = f" | SAM2: {(time.time() - t0) * 1000:.0f}ms"
 
-                    color_bgr = _color_for_class(cls_id)
-                    annotated[mask_bool] = (
-                        annotated[mask_bool].astype(np.float32) * 0.55 +
-                        np.array(color_bgr, dtype=np.float32) * 0.45
-                    ).astype(np.uint8)
-                    contours, _ = cv2.findContours(
-                        mask_bool.astype(np.uint8),
-                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-                    )
-                    cv2.drawContours(annotated, contours, -1, color_bgr, 1)
+        for i, det in enumerate(detections):
+            cls_id = yolo_cls_ids[i]
+            cls_name = det['class']
+            mask_bool = None
+
+            if sam2_masks and i < len(sam2_masks):
+                mask_bool = sam2_masks[i]
+                has_masks = True
+            elif yolo_masks_data is not None and i < len(yolo_masks_data):
+                mask_resized = cv2.resize(
+                    yolo_masks_data[i], (w, h), interpolation=cv2.INTER_NEAREST
+                )
+                mask_bool = mask_resized > 0.5
+                has_masks = True
+
+            if mask_bool is not None:
+                inst_id = len(instance_info)
+                seg_instance_map[mask_bool] = inst_id
+                instance_info.append({'cls_id': cls_id, 'cls_name': cls_name})
+
+                color_bgr = _color_for_class(cls_id)
+                annotated[mask_bool] = (
+                    annotated[mask_bool].astype(np.float32) * 0.55 +
+                    np.array(color_bgr, dtype=np.float32) * 0.45
+                ).astype(np.uint8)
+                contours, _ = cv2.findContours(
+                    mask_bool.astype(np.uint8),
+                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(annotated, contours, -1, color_bgr, 1)
 
         now = time.time()
         if self.enable_faces and has_persons and now - self._last_face_time >= self._face_interval:
@@ -303,21 +341,53 @@ class FrameProcessor:
             self._fps_counter = 0
             self._fps_time = now
 
+        # Neural depth enhancement
+        depth_for_scene = self._depth_map
+        neural_str = ""
+        if self.depth_estimator:
+            if self.depth_estimator.ready:
+                if depth_for_scene is not None:
+                    depth_for_scene = self.depth_estimator.refine_depth(frame, depth_for_scene)
+                else:
+                    depth_for_scene = self.depth_estimator.estimate_depth(frame)
+                self._depth_map_enhanced = depth_for_scene
+                neural_str = f" | Neural: {self.depth_estimator._inference_ms:.0f}ms"
+            else:
+                neural_str = " | Neural: loading..."
+
+        # DUSt3R status (async, runs in background)
+        dust3r_str = ""
+        if self.dust3r_reconstructor and self._raw_frame_right is not None:
+            if self.dust3r_reconstructor.ready:
+                dust3r_str = f" | DUSt3R: {self.dust3r_reconstructor._inference_ms:.0f}ms/{self.dust3r_reconstructor._point_count}pts"
+            else:
+                dust3r_str = " | DUSt3R: loading..."
+
         faces_str = f"Faces: {len(self._cached_face_results)}" if self.enable_faces else "Faces: off"
         depth_str = "Depth: ON" if depth_available else "Depth: waiting..."
-        seg_str = "Seg: ON" if has_masks else "Seg: off"
-        status = f"FPS: {self._fps:.0f} | {len(detections)} obj | {faces_str} | {depth_str} | {seg_str}"
+        seg_str = "SAM2" if use_sam2 else ("YOLO-seg" if has_masks else "off")
+        status = f"FPS: {self._fps:.0f} | {len(detections)} obj | {faces_str} | {depth_str} | Seg: {seg_str}{sam2_str}{neural_str}{dust3r_str}"
         cv2.putText(annotated, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
 
         with self._lock:
             self.latest_frame = annotated
             self.latest_detections = detections
 
+        # Feed stereo pair to DUSt3R (runs async in background thread)
+        if self.dust3r_reconstructor and self._raw_frame_right is not None:
+            self._dust3r_frame_count += 1
+            if self._dust3r_frame_count % 30 == 1:  # ~every 3s at 10fps
+                self.dust3r_reconstructor.set_frames(frame, self._raw_frame_right)
+
         if self.scene_reconstructor:
+            dense_cloud = None
+            if self.dust3r_reconstructor:
+                dense_cloud = self.dust3r_reconstructor.get_latest_points()
             self.scene_reconstructor.process_frame(
-                self._depth_map, detections, self._frame_shape,
+                depth_for_scene, detections, self._frame_shape,
                 seg_instance_map=seg_instance_map if has_masks else None,
                 instance_info=instance_info if has_masks else None,
+                dense_cloud=dense_cloud,
             )
 
     def _run_face_recognition(self, frame):

@@ -46,25 +46,29 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03  # robot mic -> server
+MSG_VIDEO_RIGHT = 0x04  # right stereo camera -> server
 
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
 
 
 class CameraStreamer(Node):
-    """ROS2 node: subscribes to camera + depth, buffers latest frames."""
+    """ROS2 node: subscribes to left + right cameras + depth, buffers latest frames."""
 
     def __init__(self):
         super().__init__('robot_stream_client')
         self.bridge = CvBridge()
         self._lock = threading.Lock()
         self._frame_jpeg = None
+        self._frame_right_jpeg = None
         self._depth_compressed = None
         self._new_frame = threading.Event()
+        self._new_frame_right = threading.Event()
         self._new_depth = threading.Event()
         self._raw_frame = None
 
         self.create_subscription(Image, '/image_left_raw', self._on_image, 10)
+        self.create_subscription(Image, '/image_right_raw', self._on_image_right, 10)
         self.create_subscription(CompressedImage, '/booster_video_stream', self._on_compressed, 10)
         self.create_subscription(Image, '/StereoNetNode/stereonet_depth', self._on_depth, 10)
 
@@ -79,6 +83,18 @@ class CameraStreamer(Node):
             self._encode_frame(frame)
         except Exception as e:
             self.get_logger().error(f'Image error: {e}')
+
+    def _on_image_right(self, msg):
+        try:
+            if msg.encoding == 'nv12':
+                h, w = msg.height, msg.width
+                yuv = np.frombuffer(msg.data, dtype=np.uint8).reshape((int(h * 1.5), w))
+                frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+            else:
+                frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self._encode_frame_right(frame)
+        except Exception as e:
+            self.get_logger().error(f'Right image error: {e}')
 
     def _on_compressed(self, msg):
         if self._raw_frame is not None:
@@ -102,6 +118,16 @@ class CameraStreamer(Node):
             self._frame_jpeg = jpeg.tobytes()
         self._new_frame.set()
 
+    def _encode_frame_right(self, frame):
+        h, w = frame.shape[:2]
+        if max(h, w) > 640:
+            s = 640 / max(h, w)
+            frame = cv2.resize(frame, (int(w * s), int(h * s)))
+        _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        with self._lock:
+            self._frame_right_jpeg = jpeg.tobytes()
+        self._new_frame_right.set()
+
     def _on_depth(self, msg):
         try:
             if msg.encoding == 'mono16':
@@ -123,6 +149,11 @@ class CameraStreamer(Node):
         self._new_frame.clear()
         with self._lock:
             return self._frame_jpeg
+
+    def take_frame_right(self):
+        self._new_frame_right.clear()
+        with self._lock:
+            return self._frame_right_jpeg
 
     def take_depth(self):
         self._new_depth.clear()
@@ -481,6 +512,7 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
                 print("Connected to server!")
                 tasks = [
                     asyncio.create_task(_stream_video(ws, camera, args.fps)),
+                    asyncio.create_task(_stream_video_right(ws, camera, args.fps)),
                     asyncio.create_task(_stream_depth(ws, camera, args.depth_fps)),
                     asyncio.create_task(_stream_audio(ws, pya, mic_device, args.mic_gain)),
                     asyncio.create_task(_receive_commands(ws, executor, pya)),
@@ -505,6 +537,18 @@ async def _stream_video(ws, camera: CameraStreamer, fps):
             jpeg = camera.take_frame()
             if jpeg:
                 await ws.send(bytes([MSG_VIDEO]) + jpeg)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _stream_video_right(ws, camera: CameraStreamer, fps):
+    interval = 1.0 / fps
+    try:
+        while True:
+            jpeg = camera.take_frame_right()
+            if jpeg:
+                await ws.send(bytes([MSG_VIDEO_RIGHT]) + jpeg)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass
