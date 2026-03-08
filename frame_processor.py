@@ -197,7 +197,8 @@ class FrameProcessor:
             try:
                 self._run_detection(frame)
             except Exception as e:
-                print(f"Detection error: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _get_depth_at(self, x, y, window=5):
         depth_map = self._depth_map
@@ -282,6 +283,8 @@ class FrameProcessor:
                 has_masks = True
 
             if mask_bool is not None:
+                if mask_bool.dtype != np.bool_:
+                    mask_bool = mask_bool.astype(np.bool_)
                 inst_id = len(instance_info)
                 seg_instance_map[mask_bool] = inst_id
                 instance_info.append({'cls_id': cls_id, 'cls_name': cls_name})

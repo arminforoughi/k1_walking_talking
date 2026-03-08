@@ -20,12 +20,17 @@
   #view-toolbar select { padding:4px 8px; background:#2a2a2a; color:#eee; border:1px solid #555; border-radius:4px; font-size:12px; cursor:pointer; }
   #view-toolbar button { padding:4px 10px; background:#c62828; color:#fff; border:none; border-radius:4px; font-size:11px; cursor:pointer; }
   #view-toolbar button:hover { background:#e53935; }
+  .toolbar-btn { padding:4px 10px; border:none; border-radius:4px; font-size:11px; cursor:pointer; transition: background 0.2s; }
+  .toolbar-btn.active { background:#4CAF50; color:#000; }
+  .toolbar-btn.inactive { background:#333; color:#888; }
+  .toolbar-btn:hover { opacity:0.85; }
   #scene-container { display:none; flex:1; position:relative; min-height:0; align-items:stretch; justify-content:stretch; }
   #scene-container canvas { display:block; position:absolute; top:0; left:0; width:100%; height:100%; }
-  #scene-stats { position:absolute; top:8px; left:8px; background:rgba(0,0,0,0.8); padding:8px 12px; border-radius:8px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.7; max-width:260px; }
+  #scene-stats { position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.85); padding:10px 14px; border-radius:10px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.8; max-width:280px; border: 1px solid rgba(255,255,255,0.06); backdrop-filter:blur(8px); }
   #scene-stats .stat-label { color:#666; }
   #scene-stats .stat-val { color:#eee; font-weight:bold; }
-  #scene-legend { position:absolute; bottom:8px; left:8px; background:rgba(0,0,0,0.8); padding:8px 12px; border-radius:8px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.8; }
+  #scene-stats .stat-mesh { color:#4fc3f7; }
+  #scene-legend { position:absolute; bottom:10px; left:10px; background:rgba(0,0,0,0.85); padding:8px 14px; border-radius:10px; font-size:11px; color:#aaa; z-index:5; pointer-events:none; line-height:1.8; border: 1px solid rgba(255,255,255,0.06); }
   .legend-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; vertical-align:middle; }
   #right { width:420px; display:flex; flex-direction:column; border-left:1px solid #333; min-height:0; }
   #header { padding:10px 16px; border-bottom:1px solid #333; font-size:14px; color:#888; flex-shrink:0; }
@@ -89,6 +94,7 @@
         <option value="3d_scene">3D Scene</option>
       </select>
       <button id="scene-clear-btn" style="display:none" onclick="clearScene()">Reset Scene</button>
+      <button id="follow-cam-btn" class="toolbar-btn active" style="display:none">Follow Robot</button>
     </div>
     <img id="feed" src="/frame" alt="Camera">
     <div id="scene-container">
@@ -329,79 +335,305 @@
   pollRobotStatus();
 </script>
 
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- 3D Scene Visualization                                                 -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
 <script type="module">
   import * as THREE from 'three';
   import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+  const MAX_SPLATS = 80000;
+  const ROBOT_HEIGHT = 0.9;
+
   let scene3d, renderer3d, camera3d, controls3d;
-  let pointCloud, robotGroup, trailLine;
-  let objMarkers = [];
+  let splatPoints, robotGroup, trailLine;
+  let objMeshGroups = [];
+  let objLabelSprites = [];
+  let graphEdgeLines = [];
   let scene3dReady = false, scene3dPolling = false;
+  let autoFollow = true;
+  let lastRobotPos = new THREE.Vector3();
+  let cameraTarget = new THREE.Vector3();
+
   const sceneContainer = document.getElementById('scene-container');
   const legendEl = document.getElementById('scene-legend');
+  const followBtn = document.getElementById('follow-cam-btn');
+
+  followBtn.addEventListener('click', () => {
+    autoFollow = !autoFollow;
+    followBtn.textContent = autoFollow ? 'Follow Robot' : 'Free Camera';
+    followBtn.className = 'toolbar-btn ' + (autoFollow ? 'active' : 'inactive');
+  });
+
+  // ── Robot Model ────────────────────────────────────────────────────────
+
+  function createRobot() {
+    const group = new THREE.Group();
+    const dark = new THREE.MeshStandardMaterial({ color: 0x2a2a32, metalness: 0.7, roughness: 0.3 });
+    const mid  = new THREE.MeshStandardMaterial({ color: 0x3a3a44, metalness: 0.6, roughness: 0.35 });
+    const glow = new THREE.MeshStandardMaterial({ color: 0x00ff88, emissive: 0x00ff88, emissiveIntensity: 1.2, metalness: 0.9, roughness: 0.1 });
+    const accent = new THREE.MeshStandardMaterial({ color: 0x4CAF50, emissive: 0x2a7a2a, emissiveIntensity: 0.4, metalness: 0.5, roughness: 0.3 });
+
+    // Torso
+    const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.09, 0.32, 12), dark);
+    torso.position.y = 0.52;
+    torso.castShadow = true;
+    group.add(torso);
+
+    // Chest plate
+    const chest = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.14, 0.18), accent);
+    chest.position.set(0.06, 0.54, 0);
+    chest.castShadow = true;
+    group.add(chest);
+
+    // Head
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.085, 16, 12), mid);
+    head.position.y = 0.76;
+    head.castShadow = true;
+    group.add(head);
+
+    // Visor (facing +X = forward)
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.025, 0.11), glow);
+    visor.position.set(0.075, 0.77, 0);
+    group.add(visor);
+
+    // Antenna
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.08, 6), accent);
+    antenna.position.set(0, 0.86, 0);
+    group.add(antenna);
+    const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.012, 8, 6), glow);
+    antennaTip.position.set(0, 0.905, 0);
+    group.add(antennaTip);
+
+    // Left leg
+    const legGeo = new THREE.CylinderGeometry(0.032, 0.035, 0.3, 8);
+    const lLeg = new THREE.Mesh(legGeo, dark);
+    lLeg.position.set(0, 0.2, -0.05);
+    lLeg.castShadow = true;
+    group.add(lLeg);
+
+    // Right leg
+    const rLeg = new THREE.Mesh(legGeo, dark);
+    rLeg.position.set(0, 0.2, 0.05);
+    rLeg.castShadow = true;
+    group.add(rLeg);
+
+    // Feet
+    const footGeo = new THREE.BoxGeometry(0.07, 0.025, 0.055);
+    const lFoot = new THREE.Mesh(footGeo, mid);
+    lFoot.position.set(0.01, 0.04, -0.05);
+    lFoot.castShadow = true;
+    group.add(lFoot);
+    const rFoot = new THREE.Mesh(footGeo, mid);
+    rFoot.position.set(0.01, 0.04, 0.05);
+    rFoot.castShadow = true;
+    group.add(rFoot);
+
+    // Left arm
+    const armGeo = new THREE.CylinderGeometry(0.022, 0.025, 0.24, 8);
+    const lArm = new THREE.Mesh(armGeo, mid);
+    lArm.position.set(0, 0.5, -0.14);
+    lArm.rotation.z = 0.12;
+    lArm.castShadow = true;
+    group.add(lArm);
+
+    // Right arm
+    const rArm = new THREE.Mesh(armGeo, mid);
+    rArm.position.set(0, 0.5, 0.14);
+    rArm.rotation.z = -0.12;
+    rArm.castShadow = true;
+    group.add(rArm);
+
+    // Forward direction arrow on ground
+    const arrowGeo = new THREE.ConeGeometry(0.05, 0.18, 6);
+    const arrow = new THREE.Mesh(arrowGeo, accent);
+    arrow.rotation.z = -Math.PI / 2;
+    arrow.position.set(0.22, 0.02, 0);
+    group.add(arrow);
+
+    // Spotlight from visor
+    const spot = new THREE.SpotLight(0x00ff88, 0.8, 4, Math.PI / 5, 0.5);
+    spot.position.set(0.1, 0.77, 0);
+    spot.target.position.set(3, 0, 0);
+    spot.castShadow = false;
+    group.add(spot);
+    group.add(spot.target);
+
+    // Ground ring
+    const ringGeo = new THREE.RingGeometry(0.18, 0.22, 32);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x4CAF50, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.005;
+    group.add(ring);
+
+    return group;
+  }
+
+  // ── Label Sprites ──────────────────────────────────────────────────────
+
+  function makeLabel(text, bgColor) {
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    c.width = 256; c.height = 64;
+    const ri = (bgColor >> 16) & 0xff, gi = (bgColor >> 8) & 0xff, bi = bgColor & 0xff;
+    ctx.fillStyle = `rgba(${ri},${gi},${bi},0.9)`;
+    ctx.beginPath();
+    ctx.roundRect(4, 4, 248, 56, 10);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(255,255,255,0.3)`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(4, 4, 248, 56, 10);
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 4;
+    ctx.fillText(text.substring(0, 22), 128, 32);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(1.2, 0.3, 1);
+    return sprite;
+  }
+
+  function colorToHex(arr) {
+    return (Math.round(arr[0]*255) << 16) | (Math.round(arr[1]*255) << 8) | Math.round(arr[2]*255);
+  }
+
+  // ── Scene Init ─────────────────────────────────────────────────────────
 
   function initScene3D() {
     if (scene3dReady) return;
     const canvas = document.getElementById('scene3d');
 
     scene3d = new THREE.Scene();
-    scene3d.background = new THREE.Color(0x0d0d14);
-    scene3d.fog = new THREE.FogExp2(0x0d0d14, 0.012);
+    scene3d.background = new THREE.Color(0x080810);
+    scene3d.fog = new THREE.FogExp2(0x080810, 0.018);
 
-    camera3d = new THREE.PerspectiveCamera(60, 1, 0.1, 200);
-    camera3d.position.set(-3, 8, -5);
+    camera3d = new THREE.PerspectiveCamera(55, 1, 0.1, 200);
+    camera3d.position.set(-2, 5, -4);
     camera3d.lookAt(0, 0, 0);
 
     renderer3d = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer3d.shadowMap.enabled = true;
+    renderer3d.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer3d.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer3d.toneMappingExposure = 1.3;
+    renderer3d.outputEncoding = THREE.sRGBEncoding;
 
     controls3d = new OrbitControls(camera3d, renderer3d.domElement);
     controls3d.enableDamping = true;
-    controls3d.dampingFactor = 0.1;
+    controls3d.dampingFactor = 0.08;
     controls3d.maxPolarAngle = Math.PI * 0.85;
-    controls3d.minDistance = 1;
+    controls3d.minDistance = 0.5;
     controls3d.maxDistance = 60;
+    controls3d.target.set(0, 0.5, 0);
 
-    const grid = new THREE.GridHelper(40, 80, 0x1a3a1a, 0x121818);
-    scene3d.add(grid);
+    // Lighting
+    const hemiLight = new THREE.HemisphereLight(0x6688cc, 0x443322, 0.4);
+    scene3d.add(hemiLight);
 
-    const axes = new THREE.AxesHelper(1.5);
-    scene3d.add(axes);
-
-    scene3d.add(new THREE.AmbientLight(0xffffff, 0.5));
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.3);
-    dirLight.position.set(5, 10, -5);
+    const dirLight = new THREE.DirectionalLight(0xffeedd, 0.8);
+    dirLight.position.set(8, 15, -6);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.camera.left = -20;
+    dirLight.shadow.camera.right = 20;
+    dirLight.shadow.camera.top = 20;
+    dirLight.shadow.camera.bottom = -20;
+    dirLight.shadow.bias = -0.0005;
     scene3d.add(dirLight);
 
-    const pcGeo = new THREE.BufferGeometry();
-    pcGeo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
-    pcGeo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
-    const pcMat = new THREE.PointsMaterial({
-      size: 0.04, vertexColors: true, sizeAttenuation: true,
-      transparent: true, opacity: 0.9,
-    });
-    pointCloud = new THREE.Points(pcGeo, pcMat);
-    scene3d.add(pointCloud);
+    const fillLight = new THREE.DirectionalLight(0x8888ff, 0.15);
+    fillLight.position.set(-5, 3, 8);
+    scene3d.add(fillLight);
 
-    robotGroup = new THREE.Group();
-    const cone = new THREE.Mesh(
-      new THREE.ConeGeometry(0.14, 0.4, 8),
-      new THREE.MeshStandardMaterial({ color: 0x4CAF50, emissive: 0x2a7a2a })
-    );
-    cone.rotation.z = -Math.PI / 2;
-    cone.position.x = 0.18;
-    robotGroup.add(cone);
-    const body = new THREE.Mesh(
-      new THREE.SphereGeometry(0.14, 12, 8),
-      new THREE.MeshStandardMaterial({ color: 0x66BB6A, emissive: 0x336636 })
-    );
-    robotGroup.add(body);
-    robotGroup.position.y = 0.25;
+    // Ground plane
+    const groundGeo = new THREE.PlaneGeometry(200, 200);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x0c0c12,
+      metalness: 0.6,
+      roughness: 0.4,
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.01;
+    ground.receiveShadow = true;
+    scene3d.add(ground);
+
+    // Grid
+    const grid = new THREE.GridHelper(60, 120, 0x1a2a1a, 0x0f1510);
+    grid.position.y = 0.001;
+    scene3d.add(grid);
+
+    // Axes
+    const axes = new THREE.AxesHelper(1.0);
+    axes.position.y = 0.002;
+    scene3d.add(axes);
+
+    // Robot
+    robotGroup = createRobot();
     scene3d.add(robotGroup);
 
+    // Gaussian Splat Points
+    const splatGeo = new THREE.BufferGeometry();
+    splatGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(MAX_SPLATS * 3), 3));
+    splatGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(MAX_SPLATS * 3), 3));
+    splatGeo.setAttribute('opacity', new THREE.Float32BufferAttribute(new Float32Array(MAX_SPLATS), 1));
+    splatGeo.setAttribute('scale', new THREE.Float32BufferAttribute(new Float32Array(MAX_SPLATS), 1));
+    splatGeo.setDrawRange(0, 0);
+
+    const splatMat = new THREE.ShaderMaterial({
+      vertexShader: `
+        attribute float opacity;
+        attribute float scale;
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+          vColor = color;
+          vAlpha = opacity;
+          vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = scale * 800.0 / -mvPos.z;
+          gl_PointSize = clamp(gl_PointSize, 1.0, 64.0);
+          gl_Position = projectionMatrix * mvPos;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+          vec2 uv = gl_PointCoord - 0.5;
+          float g = exp(-dot(uv, uv) * 8.0);
+          float alpha = g * vAlpha;
+          if (alpha < 0.02) discard;
+          gl_FragColor = vec4(vColor * alpha, alpha);
+        }
+      `,
+      vertexColors: true,
+      transparent: true,
+      depthWrite: false,
+      depthTest: true,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.SrcAlphaFactor,
+      blendDst: THREE.OneMinusSrcAlphaFactor,
+      blendEquation: THREE.AddEquation,
+    });
+
+    splatPoints = new THREE.Points(splatGeo, splatMat);
+    splatPoints.frustumCulled = false;
+    scene3d.add(splatPoints);
+
+    // Trail
     const trailGeo = new THREE.BufferGeometry();
     trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
-    const trailMat = new THREE.LineBasicMaterial({ color: 0x4CAF50, opacity: 0.4, transparent: true });
+    const trailMat = new THREE.LineBasicMaterial({ color: 0x4CAF50, opacity: 0.5, transparent: true, linewidth: 1 });
     trailLine = new THREE.Line(trailGeo, trailMat);
     scene3d.add(trailLine);
 
@@ -409,143 +641,251 @@
     animate3D();
   }
 
+  // ── Resize ─────────────────────────────────────────────────────────────
+
   function resizeScene() {
     if (!scene3dReady) return;
-    const w = sceneContainer.clientWidth || sceneContainer.offsetWidth || 800;
-    const h = sceneContainer.clientHeight || sceneContainer.offsetHeight || 600;
+    const w = sceneContainer.clientWidth || 800;
+    const h = sceneContainer.clientHeight || 600;
     if (w < 10 || h < 10) return;
     renderer3d.setSize(w, h);
     camera3d.aspect = w / h;
     camera3d.updateProjectionMatrix();
-    renderer3d.render(scene3d, camera3d);
   }
   window.addEventListener('resize', resizeScene);
+
+  // ── Animation ──────────────────────────────────────────────────────────
 
   function animate3D() {
     if (!scene3dReady) return;
     requestAnimationFrame(animate3D);
+
+    if (autoFollow && lastRobotPos.lengthSq() > 0) {
+      cameraTarget.lerp(lastRobotPos, 0.04);
+      controls3d.target.copy(cameraTarget);
+      controls3d.target.y = 0.4;
+    }
+
     controls3d.update();
     renderer3d.render(scene3d, camera3d);
   }
 
-  function makeLabel(text, bgColor) {
-    const c = document.createElement('canvas');
-    const ctx = c.getContext('2d');
-    c.width = 256; c.height = 64;
-    const r = (bgColor >> 16) & 0xff, g = (bgColor >> 8) & 0xff, b = bgColor & 0xff;
-    ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
-    ctx.beginPath();
-    ctx.roundRect(4, 4, 248, 56, 8);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 22px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text.substring(0, 22), 128, 32);
-    const tex = new THREE.CanvasTexture(c);
-    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
-    const sprite = new THREE.Sprite(mat);
-    sprite.scale.set(1.3, 0.32, 1);
-    return sprite;
+  // ── Dispose Helpers ────────────────────────────────────────────────────
+
+  function disposeGroup(group) {
+    group.traverse(child => {
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) {
+        if (child.material.map) child.material.map.dispose();
+        child.material.dispose();
+      }
+    });
   }
 
-  function colorToHex(arr) {
-    const ri = Math.round(arr[0] * 255), gi = Math.round(arr[1] * 255), bi = Math.round(arr[2] * 255);
-    return (ri << 16) | (gi << 8) | bi;
-  }
+  // ── Update Scene ───────────────────────────────────────────────────────
+
+  const _mat4 = new THREE.Matrix4();
+  const _color = new THREE.Color();
 
   function updateScene3D(data) {
     if (!scene3dReady) return;
+    const rb = data.robot;
 
-    if (data.points.count > 0) {
-      const pos = new Float32Array(data.points.positions);
-      const col = new Float32Array(data.points.colors);
-      pointCloud.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-      pointCloud.geometry.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
-      pointCloud.geometry.computeBoundingSphere();
+    // ── Gaussian Splats ──────────────────────────────────────────────
+    const splatData = data.splats;
+    if (splatData && splatData.count > 0) {
+      const count = Math.min(splatData.count, MAX_SPLATS);
+      const geo = splatPoints.geometry;
+      const posArr = geo.attributes.position.array;
+      const colArr = geo.attributes.color.array;
+      const opaArr = geo.attributes.opacity.array;
+      const scaArr = geo.attributes.scale.array;
+
+      for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        posArr[i3]     = splatData.positions[i3];
+        posArr[i3 + 1] = splatData.positions[i3 + 1];
+        posArr[i3 + 2] = splatData.positions[i3 + 2];
+        colArr[i3]     = splatData.colors[i3];
+        colArr[i3 + 1] = splatData.colors[i3 + 1];
+        colArr[i3 + 2] = splatData.colors[i3 + 2];
+        opaArr[i]      = splatData.opacities[i];
+        scaArr[i]      = splatData.scales[i];
+      }
+
+      geo.attributes.position.needsUpdate = true;
+      geo.attributes.color.needsUpdate = true;
+      geo.attributes.opacity.needsUpdate = true;
+      geo.attributes.scale.needsUpdate = true;
+      geo.setDrawRange(0, count);
+    } else {
+      splatPoints.geometry.setDrawRange(0, 0);
     }
 
-    const rb = data.robot;
-    robotGroup.position.set(rb.x, 0.25, rb.z);
-    robotGroup.rotation.y = -rb.theta;
+    // ── Object Meshes ────────────────────────────────────────────────
+    for (const g of objMeshGroups) { scene3d.remove(g); disposeGroup(g); }
+    for (const s of objLabelSprites) { scene3d.remove(s); disposeGroup(s); }
+    objMeshGroups = [];
+    objLabelSprites = [];
 
+    const legendLabels = {};
+
+    if (data.object_meshes && data.object_meshes.length > 0) {
+      for (const om of data.object_meshes) {
+        const hex = colorToHex(om.color);
+        const g = new THREE.Group();
+
+        // Solid mesh
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(om.vertices, 3));
+        geo.setAttribute('normal', new THREE.Float32BufferAttribute(om.normals, 3));
+        geo.setIndex(om.indices);
+
+        const mat = new THREE.MeshStandardMaterial({
+          color: hex,
+          metalness: 0.15,
+          roughness: 0.6,
+          transparent: true,
+          opacity: 0.75,
+          side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        g.add(mesh);
+
+        // Wireframe overlay
+        const wireGeo = new THREE.BufferGeometry();
+        wireGeo.setAttribute('position', new THREE.Float32BufferAttribute(om.vertices, 3));
+        wireGeo.setIndex(om.indices);
+        const wireMat = new THREE.MeshBasicMaterial({
+          color: hex, wireframe: true, transparent: true, opacity: 0.4,
+        });
+        g.add(new THREE.Mesh(wireGeo, wireMat));
+
+        // Edge highlight
+        const edgeGeo = new THREE.EdgesGeometry(geo, 30);
+        const edgeMat = new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.6 });
+        g.add(new THREE.LineSegments(edgeGeo, edgeMat));
+
+        scene3d.add(g);
+        objMeshGroups.push(g);
+
+        // Label above mesh centroid
+        geo.computeBoundingBox();
+        const bb = geo.boundingBox;
+        if (bb) {
+          const cx = (bb.min.x + bb.max.x) / 2;
+          const cy = bb.max.y + 0.3;
+          const cz = (bb.min.z + bb.max.z) / 2;
+          const label = makeLabel(om.label, hex);
+          label.position.set(cx, cy, cz);
+          scene3d.add(label);
+          objLabelSprites.push(label);
+        }
+
+        legendLabels[om.label] = om.color;
+      }
+    }
+
+    // Fallback: bounding box markers for objects without meshes
+    for (const obj of data.objects) {
+      if (data.object_meshes && data.object_meshes.some(m => m.label === obj.label)) continue;
+
+      const hex = colorToHex(obj.color);
+      const g = new THREE.Group();
+      const sx = obj.sx || 0.3, sy = obj.sy || 0.3, sz = obj.sz || 0.3;
+
+      const solidMat = new THREE.MeshStandardMaterial({
+        color: hex, transparent: true, opacity: 0.2, emissive: hex, emissiveIntensity: 0.2,
+      });
+      g.add(new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), solidMat));
+
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(sx, sy, sz)),
+        new THREE.LineBasicMaterial({ color: hex, transparent: true, opacity: 0.7 })
+      );
+      g.add(edges);
+
+      g.position.set(obj.x, Math.max(obj.y, 0) + sy / 2, obj.z);
+      scene3d.add(g);
+      objMeshGroups.push(g);
+
+      const label = makeLabel(obj.label, hex);
+      label.position.set(obj.x, Math.max(obj.y, 0) + sy + 0.35, obj.z);
+      scene3d.add(label);
+      objLabelSprites.push(label);
+
+      legendLabels[obj.label] = obj.color;
+    }
+
+    // ── Robot ────────────────────────────────────────────────────────
+    robotGroup.position.set(rb.x, 0, rb.z);
+    robotGroup.rotation.y = -rb.theta;
+    lastRobotPos.set(rb.x, 0, rb.z);
+
+    // ── Trajectory ───────────────────────────────────────────────────
     if (data.trajectory.length >= 6) {
       trailLine.geometry.setAttribute('position',
         new THREE.Float32BufferAttribute(new Float32Array(data.trajectory), 3));
       trailLine.geometry.computeBoundingSphere();
     }
 
-    for (const m of objMarkers) {
-      scene3d.remove(m);
-      m.traverse(child => {
-        if (child.geometry) child.geometry.dispose();
-        if (child.material) {
-          if (child.material.map) child.material.map.dispose();
-          child.material.dispose();
-        }
-      });
-    }
-    objMarkers = [];
+    // ── Scene Graph Edges ────────────────────────────────────────────
+    for (const line of graphEdgeLines) { scene3d.remove(line); if (line.geometry) line.geometry.dispose(); if (line.material) line.material.dispose(); }
+    graphEdgeLines = [];
 
-    const legendLabels = {};
-
-    for (const obj of data.objects) {
-      const g = new THREE.Group();
-      const hex = colorToHex(obj.color);
-
-      const sx = obj.sx || 0.3;
-      const sy = obj.sy || 0.3;
-      const sz = obj.sz || 0.3;
-
-      const wire = new THREE.Mesh(
-        new THREE.BoxGeometry(sx, sy, sz),
-        new THREE.MeshBasicMaterial({ color: hex, wireframe: true, transparent: true, opacity: 0.8 })
-      );
-      g.add(wire);
-
-      const solid = new THREE.Mesh(
-        new THREE.BoxGeometry(sx * 0.98, sy * 0.98, sz * 0.98),
-        new THREE.MeshStandardMaterial({ color: hex, transparent: true, opacity: 0.18, emissive: hex, emissiveIntensity: 0.3 })
-      );
-      g.add(solid);
-
-      const edges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.BoxGeometry(sx, sy, sz)),
-        new THREE.LineBasicMaterial({ color: hex, linewidth: 2 })
-      );
-      g.add(edges);
-
-      const label = makeLabel(obj.label, hex);
-      label.position.y = sy / 2 + 0.35;
-      g.add(label);
-
-      if (obj.point_count > 0) {
-        const ptLabel = makeLabel(obj.point_count + ' pts', 0x333333);
-        ptLabel.position.y = sy / 2 + 0.65;
-        ptLabel.scale.set(0.8, 0.2, 1);
-        g.add(ptLabel);
+    if (data.scene_graph && data.scene_graph.edges) {
+      const nodeMap = {};
+      for (const node of (data.scene_graph.nodes || [])) {
+        nodeMap[node.id] = node;
       }
+      for (const edge of data.scene_graph.edges) {
+        const srcNode = nodeMap[edge.src];
+        const dstNode = nodeMap[edge.dst];
+        if (!srcNode || !dstNode) continue;
 
-      g.position.set(obj.x, Math.max(obj.y, 0) + sy / 2, obj.z);
-      scene3d.add(g);
-      objMarkers.push(g);
+        const pts = [
+          new THREE.Vector3(srcNode.x, srcNode.y + 0.3, srcNode.z),
+          new THREE.Vector3(dstNode.x, dstNode.y + 0.3, dstNode.z),
+        ];
+        const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+        const lineMat = new THREE.LineDashedMaterial({
+          color: 0x88aaff, dashSize: 0.15, gapSize: 0.08,
+          transparent: true, opacity: 0.5,
+        });
+        const dashLine = new THREE.Line(lineGeo, lineMat);
+        dashLine.computeLineDistances();
+        scene3d.add(dashLine);
+        graphEdgeLines.push(dashLine);
 
-      legendLabels[obj.label] = obj.color;
+        const mid = new THREE.Vector3().addVectors(pts[0], pts[1]).multiplyScalar(0.5);
+        mid.y += 0.15;
+        const relLabel = makeLabel(edge.relationship, 0x445588);
+        relLabel.scale.set(0.8, 0.2, 1);
+        relLabel.position.copy(mid);
+        scene3d.add(relLabel);
+        graphEdgeLines.push(relLabel);
+      }
     }
 
+    // ── Stats ────────────────────────────────────────────────────────
     const stats = document.getElementById('scene-stats');
     if (stats) {
-      const cc = data.class_counts || {};
-      const structPts = cc['_structure'] || 0;
-      const objPts = cc['_object'] || 0;
+      const splatCount = splatData ? splatData.count : 0;
+      const meshCount = (data.object_meshes || []).length;
+      const graphNodes = data.scene_graph ? (data.scene_graph.nodes || []).length : 0;
+      const graphEdges = data.scene_graph ? (data.scene_graph.edges || []).length : 0;
       stats.innerHTML =
-        '<span class="stat-label">Points:</span> <span class="stat-val">' + data.points.count.toLocaleString() + '</span>' +
-        ' <span style="color:#555">(obj: ' + objPts.toLocaleString() + ' / struct: ' + structPts.toLocaleString() + ')</span>' +
+        '<span class="stat-label">Splats:</span> <span class="stat-val">' + splatCount.toLocaleString() + '</span>' +
         '<br><span class="stat-label">Objects:</span> <span class="stat-val">' + data.objects.length + '</span>' +
+        (meshCount > 0 ? ' &middot; <span class="stat-mesh">' + meshCount + ' meshes</span>' : '') +
+        (graphNodes > 0 ? '<br><span class="stat-label">Scene Graph:</span> ' + graphNodes + ' nodes, ' + graphEdges + ' edges' : '') +
         '<br><span class="stat-label">Robot:</span> (' + rb.x.toFixed(1) + ', ' + rb.z.toFixed(1) + ')' +
         ' &theta;=' + (rb.theta * 180 / Math.PI).toFixed(0) + '&deg;';
     }
 
+    // ── Legend ────────────────────────────────────────────────────────
     if (legendEl) {
       const entries = Object.entries(legendLabels);
       if (entries.length > 0) {
@@ -559,6 +899,8 @@
     }
   }
 
+  // ── Polling ────────────────────────────────────────────────────────────
+
   async function pollScene() {
     if (!scene3dPolling) return;
     try {
@@ -569,6 +911,8 @@
     if (scene3dPolling) setTimeout(pollScene, 500);
   }
 
+  // ── View Selector ──────────────────────────────────────────────────────
+
   const viewSelect = document.getElementById('view-select');
   viewSelect.addEventListener('change', function() {
     const v = viewSelect.value;
@@ -577,6 +921,7 @@
       feed.style.display = 'none';
       sceneContainer.style.display = 'flex';
       document.getElementById('scene-clear-btn').style.display = '';
+      document.getElementById('follow-cam-btn').style.display = '';
       window.framePolling = false;
       initScene3D();
       requestAnimationFrame(() => { requestAnimationFrame(() => { resizeScene(); }); });
@@ -586,6 +931,7 @@
       feed.style.display = '';
       sceneContainer.style.display = 'none';
       document.getElementById('scene-clear-btn').style.display = 'none';
+      document.getElementById('follow-cam-btn').style.display = 'none';
       scene3dPolling = false;
       window.framePolling = true;
     }

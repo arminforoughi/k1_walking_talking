@@ -272,7 +272,7 @@ class SceneReconstructor:
                 extra_remove = obj_indices[obj_sort[:remaining]]
                 remove_set.update(extra_remove.tolist())
 
-            keep = np.array([i for i in range(n) if i not in remove_set])
+            keep = np.array([i for i in range(n) if i not in remove_set], dtype=np.intp)
 
         if len(keep) == 0:
             self._n_splats = 0
@@ -503,10 +503,8 @@ class SceneReconstructor:
 
         if seg_instance_map is not None and instance_info:
             ilh, ilw = seg_instance_map.shape
-            u_frame = (uu_v * ilw / dw).astype(int)
-            v_frame = (vv_v * ilh / dh).astype(int)
-            np.clip(u_frame, 0, ilw - 1, out=u_frame)
-            np.clip(v_frame, 0, ilh - 1, out=v_frame)
+            u_frame = np.clip((uu_v * ilw / dw).astype(np.intp), 0, ilw - 1)
+            v_frame = np.clip((vv_v * ilh / dh).astype(np.intp), 0, ilh - 1)
             sampled_instances = seg_instance_map[v_frame, u_frame]
 
             for inst_id, info in enumerate(instance_info):
@@ -567,7 +565,7 @@ class SceneReconstructor:
                         'vertices': mesh_data['vertices'],
                         'indices': mesh_data['indices'],
                         'normals': mesh_data['normals'],
-                        'color': list(get_class_color(info['cls_name'])),
+                        'color': [float(x) for x in get_class_color(info['cls_name'])],
                     })
 
         return positions, colors, obj_id_arr, obj_clusters, new_obj_meshes
@@ -611,7 +609,7 @@ class SceneReconstructor:
             else:
                 continue
 
-            color = list(get_class_color(det['class']))
+            color = [float(x) for x in get_class_color(det['class'])]
 
             merged = False
             for obj in self._objects:
@@ -666,14 +664,14 @@ class SceneReconstructor:
         for o in objects:
             scene_objects.append({
                 'label': o['label'],
-                'x': round(o['x'], 2),
-                'y': round(o['z'], 2),
-                'z': round(o['y'], 2),
-                'sx': round(o.get('sx', 0.3), 2),
-                'sy': round(o.get('sz', 0.3), 2),
-                'sz': round(o.get('sy', 0.3), 2),
-                'point_count': o.get('point_count', 0),
-                'color': o.get('color', [0.13, 0.59, 0.95]),
+                'x': round(float(o['x']), 2),
+                'y': round(float(o['z']), 2),
+                'z': round(float(o['y']), 2),
+                'sx': round(float(o.get('sx', 0.3)), 2),
+                'sy': round(float(o.get('sz', 0.3)), 2),
+                'sz': round(float(o.get('sy', 0.3)), 2),
+                'point_count': int(o.get('point_count', 0)),
+                'color': [float(c) for c in o.get('color', [0.13, 0.59, 0.95])],
             })
 
         mesh_list = []
@@ -683,7 +681,7 @@ class SceneReconstructor:
                 'vertices': [round(float(x), 3) for x in m['vertices'].flatten()],
                 'indices': [int(x) for x in m['indices']],
                 'normals': [round(float(x), 3) for x in m['normals'].flatten()],
-                'color': m['color'],
+                'color': [float(c) for c in m['color']],
             })
 
         scene_traj = []
