@@ -48,6 +48,9 @@ MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03  # robot mic -> server
 MSG_VIDEO_RIGHT = 0x04  # right stereo camera -> server
 
+# --- TEMPORARY: save stereo footage to disk (set to a path to enable) ---
+RECORD_STEREO_DIR = os.environ.get("RECORD_STEREO_DIR", "")  # e.g. "/tmp/robot_stereo"
+
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
 
@@ -66,6 +69,13 @@ class CameraStreamer(Node):
         self._new_frame_right = threading.Event()
         self._new_depth = threading.Event()
         self._raw_frame = None
+        # TEMPORARY: stereo recording counters
+        self._record_left_count = 0
+        self._record_right_count = 0
+        if RECORD_STEREO_DIR:
+            os.makedirs(os.path.join(RECORD_STEREO_DIR, "left"), exist_ok=True)
+            os.makedirs(os.path.join(RECORD_STEREO_DIR, "right"), exist_ok=True)
+            self.get_logger().info(f"Recording stereo to {RECORD_STEREO_DIR}")
 
         self.create_subscription(Image, '/image_left_raw', self._on_image, 10)
         self.create_subscription(Image, '/image_right_raw', self._on_image_right, 10)
@@ -112,6 +122,10 @@ class CameraStreamer(Node):
         if max(h, w) > 640:
             s = 640 / max(h, w)
             frame = cv2.resize(frame, (int(w * s), int(h * s)))
+        if RECORD_STEREO_DIR:
+            p = os.path.join(RECORD_STEREO_DIR, "left", f"{self._record_left_count:06d}.png")
+            cv2.imwrite(p, frame)
+            self._record_left_count += 1
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         with self._lock:
             self._raw_frame = frame
@@ -123,6 +137,10 @@ class CameraStreamer(Node):
         if max(h, w) > 640:
             s = 640 / max(h, w)
             frame = cv2.resize(frame, (int(w * s), int(h * s)))
+        if RECORD_STEREO_DIR:
+            p = os.path.join(RECORD_STEREO_DIR, "right", f"{self._record_right_count:06d}.png")
+            cv2.imwrite(p, frame)
+            self._record_right_count += 1
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         with self._lock:
             self._frame_right_jpeg = jpeg.tobytes()
