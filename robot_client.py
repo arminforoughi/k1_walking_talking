@@ -52,6 +52,24 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03  # robot mic -> server
+MSG_POSE = 0x04      # 16 x float32 row-major world_T_cam (camera in world)
+
+
+def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Quaternion (x,y,z,w) -> 3x3 rotation matrix."""
+    n = qx * qx + qy * qy + qz * qz + qw * qw
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    x, y, z, w = qx, qy, qz, qw
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+    return np.array([
+        [1.0 - (yy + zz), xy - wz, xz + wy],
+        [xy + wz, 1.0 - (xx + zz), yz - wx],
+        [xz - wy, yz + wx, 1.0 - (xx + yy)],
+    ], dtype=np.float64)
 
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
@@ -60,14 +78,16 @@ MSG_AUDIO_IN = 0x03  # robot mic -> server
 class CameraStreamer(Node):
     """ROS2 node: subscribes to camera + depth, buffers latest frames."""
 
-    def __init__(self, image_topic: str = None, depth_topic: str = None):
+    def __init__(self, image_topic: str = None, depth_topic: str = None, pose_topic: str = None):
         super().__init__('robot_stream_client')
         self.bridge = CvBridge()
         self._lock = threading.Lock()
         self._frame_jpeg = None
         self._depth_compressed = None
+        self._pose_payload = None  # 16*4 bytes float32 world_T_cam
         self._new_frame = threading.Event()
         self._new_depth = threading.Event()
+        self._new_pose = threading.Event()
         self._raw_frame = None
 
         # Default: K1 / StereoNet; override with --image-topic / --depth-topic for ZED
@@ -79,6 +99,20 @@ class CameraStreamer(Node):
         if img2:
             self.create_subscription(CompressedImage, img2, self._on_compressed, 10)
         self.create_subscription(Image, dep, self._on_depth, 10)
+
+        if pose_topic:
+            # Support common ROS2 pose messages without forcing deps if unused
+            try:
+                from nav_msgs.msg import Odometry
+                self.create_subscription(Odometry, pose_topic, self._on_odom, 10)
+                self.get_logger().info(f"Subscribed pose (Odometry): {pose_topic}")
+            except Exception:
+                try:
+                    from geometry_msgs.msg import PoseStamped
+                    self.create_subscription(PoseStamped, pose_topic, self._on_pose_stamped, 10)
+                    self.get_logger().info(f"Subscribed pose (PoseStamped): {pose_topic}")
+                except Exception as e:
+                    self.get_logger().error(f"Pose topic subscription failed: {e}")
 
     def _on_image(self, msg):
         try:
@@ -144,6 +178,40 @@ class CameraStreamer(Node):
         self._new_depth.clear()
         with self._lock:
             return self._depth_compressed
+
+    def take_pose(self):
+        self._new_pose.clear()
+        with self._lock:
+            return self._pose_payload
+
+    def _pose_to_payload(self, px: float, py: float, pz: float, qx: float, qy: float, qz: float, qw: float) -> bytes:
+        R = _quat_to_R(qx, qy, qz, qw)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R.astype(np.float32)
+        T[:3, 3] = np.array([px, py, pz], dtype=np.float32)
+        return T.tobytes(order='C')
+
+    def _on_odom(self, msg):
+        try:
+            p = msg.pose.pose.position
+            q = msg.pose.pose.orientation
+            payload = self._pose_to_payload(p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+            with self._lock:
+                self._pose_payload = payload
+            self._new_pose.set()
+        except Exception as e:
+            self.get_logger().error(f'Odom pose error: {e}')
+
+    def _on_pose_stamped(self, msg):
+        try:
+            p = msg.pose.position
+            q = msg.pose.orientation
+            payload = self._pose_to_payload(p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+            with self._lock:
+                self._pose_payload = payload
+            self._new_pose.set()
+        except Exception as e:
+            self.get_logger().error(f'PoseStamped error: {e}')
 
 
 # ── Robot Command Executor ──────────────────────────────────────────────────
@@ -499,8 +567,10 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
                     asyncio.create_task(_stream_video(ws, camera, args.fps)),
                     asyncio.create_task(_stream_depth(ws, camera, args.depth_fps)),
                     asyncio.create_task(_stream_audio(ws, pya, mic_device, args.mic_gain)),
+                    asyncio.create_task(_stream_pose(ws, camera, args.pose_fps)) if args.pose_topic else None,
                     asyncio.create_task(_receive_commands(ws, executor, pya)),
                 ]
+                tasks = [t for t in tasks if t is not None]
                 try:
                     await asyncio.gather(*tasks)
                 except websockets.ConnectionClosed:
@@ -563,6 +633,18 @@ async def _stream_audio(ws, pya, mic_device, mic_gain):
         stream.close()
 
 
+async def _stream_pose(ws, camera: CameraStreamer, fps: float):
+    interval = 1.0 / max(1e-6, float(fps))
+    try:
+        while True:
+            payload = camera.take_pose()
+            if payload and len(payload) == 16 * 4:
+                await ws.send(bytes([MSG_POSE]) + payload)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+
+
 async def _receive_commands(ws, executor: RobotExecutor, pya):
     speaker = pya.open(
         format=AUDIO_FORMAT, channels=AUDIO_CHANNELS, rate=RECV_SAMPLE_RATE,
@@ -603,6 +685,9 @@ def main():
                         help='ROS2 image topic (e.g. /zed2i/zed_node/left/image_rect_color for ZED)')
     parser.add_argument('--depth-topic', type=str, default=None,
                         help='ROS2 depth topic (e.g. /zed2i/zed_node/depth/depth_registered for ZED)')
+    parser.add_argument('--pose-topic', type=str, default=None,
+                        help='ROS2 pose topic for camera pose (Odometry or PoseStamped). If set, server TSDF uses it.')
+    parser.add_argument('--pose-fps', type=float, default=30.0, help='Pose stream FPS (only if --pose-topic is set)')
     parser.add_argument('--mic-gain', type=float, default=3.0, help='Mic gain multiplier')
     parser.add_argument('--mic-device', type=int, default=None, help='PyAudio mic device index')
     args = parser.parse_args()
@@ -634,6 +719,7 @@ def main():
     camera = CameraStreamer(
         image_topic=args.image_topic,
         depth_topic=args.depth_topic,
+        pose_topic=args.pose_topic,
     )
     ros_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
     ros_thread.start()

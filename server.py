@@ -67,6 +67,7 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03
+MSG_POSE = 0x04  # 16 x float32 row-major world_T_cam (camera in world)
 # server -> robot
 MSG_AUDIO_OUT = 0x10
 
@@ -248,6 +249,17 @@ class FrameProcessor:
         self._detect_event = threading.Event()
         self._detect_thread.start()
 
+        # TSDF mesh (optional): fused 3D model + plane contours for /3d-mesh viewer
+        self._tsdf = None
+        self._tsdf_disabled = False  # set True if Open3D unavailable (e.g. Python 3.13+)
+        self._tsdf_integrations = 0
+        self._tsdf_mesh_cache = None
+        self._tsdf_cache_integrations = -1
+
+        # Latest pose (camera-in-world). If robot does not stream pose, stays identity.
+        self._world_T_cam = np.eye(4, dtype=np.float64)
+        self._pose_timestamp = 0.0
+
     def on_video_frame(self, jpeg_bytes):
         frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
         if frame is not None:
@@ -262,8 +274,97 @@ class FrameProcessor:
             raw = zlib.decompress(data[4:])
             depth = np.frombuffer(raw, dtype=np.uint16).reshape((h, w))
             self._depth_map = depth
+            # Integrate into TSDF when we have both depth and RGB (for /3d-mesh viewer)
+            with self._lock:
+                raw_frame = self._raw_frame
+            if raw_frame is not None:
+                self._integrate_tsdf(depth, raw_frame)
         except Exception as e:
             print(f"Depth decode error: {e}")
+
+    def on_pose_frame(self, payload: bytes) -> None:
+        """Update latest camera pose (world_T_cam) from robot."""
+        try:
+            if len(payload) != 16 * 4:
+                return
+            mat = np.frombuffer(payload, dtype=np.float32).reshape((4, 4)).astype(np.float64)
+            if not np.isfinite(mat).all():
+                return
+            with self._lock:
+                self._world_T_cam = mat
+                self._pose_timestamp = time.time()
+        except Exception:
+            return
+
+    def _integrate_tsdf(self, depth_uint16, bgr_frame):
+        """Integrate one depth+RGB frame into TSDF (lazy-init). Thread-safe."""
+        if self._tsdf_disabled:
+            return
+        try:
+            from reconstruction.tsdf_live import LiveTSDF
+        except ImportError:
+            try:
+                import sys
+                _root = os.path.dirname(os.path.abspath(__file__))
+                if _root not in sys.path:
+                    sys.path.insert(0, _root)
+                from reconstruction.tsdf_live import LiveTSDF
+            except ImportError as e:
+                self._tsdf_disabled = True
+                print(f"TSDF disabled (Open3D not available): {e}")
+                return
+        try:
+            with self._lock:
+                if self._tsdf is None:
+                    self._tsdf = LiveTSDF(voxel_size=0.02, depth_scale=1.0 / 1000.0, depth_min=0.2, depth_max=5.0)
+                dh, dw = depth_uint16.shape
+                depth_m = depth_uint16.astype(np.float32) / 1000.0  # mm -> meters
+                rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                if rgb.shape[0] != dh or rgb.shape[1] != dw:
+                    rgb = cv2.resize(rgb, (dw, dh))
+                fx = fy = max(dw, dh) * 1.2
+                cx, cy = dw / 2.0, dh / 2.0
+                world_T_cam = self._world_T_cam.copy()
+                self._tsdf.integrate(depth_m, rgb, fx, fy, cx, cy, world_T_cam)
+                self._tsdf_integrations += 1
+                self._tsdf_mesh_cache = None  # invalidate cache
+        except Exception as e:
+            self._tsdf_disabled = True
+            print(f"TSDF disabled: {e}")
+
+    def get_tsdf_mesh_json(self):
+        """Return JSON-serializable dict with mesh (positions, indices, colors) and planes (boundaries), or None."""
+        with self._lock:
+            if self._tsdf is None or self._tsdf_integrations == 0:
+                return None
+            if self._tsdf_mesh_cache is not None and self._tsdf_cache_integrations == self._tsdf_integrations:
+                return self._tsdf_mesh_cache
+            tsdf = self._tsdf
+            integrations = self._tsdf_integrations
+        try:
+            mesh = tsdf.get_mesh(simplify=True, target_triangles=80000)
+            verts = np.asarray(mesh.vertices)
+            tris = np.asarray(mesh.triangles)
+            cols = np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else np.ones((len(verts), 3))
+            positions = verts.flatten().tolist()
+            indices = tris.flatten().tolist()
+            colors = cols.flatten().tolist()
+            planes = []
+            try:
+                from reconstruction.tsdf_live import extract_plane_contours
+                contours = extract_plane_contours(mesh, distance_threshold=0.025, min_inliers=60, max_planes=12)
+                for _, boundary_xyz, _ in contours:
+                    planes.append(boundary_xyz.tolist())
+            except Exception:
+                pass
+            out = {"positions": positions, "indices": indices, "colors": colors, "planes": planes, "integrations": integrations}
+            with self._lock:
+                self._tsdf_mesh_cache = out
+                self._tsdf_cache_integrations = integrations
+            return out
+        except Exception as e:
+            print(f"TSDF mesh export error: {e}")
+            return None
 
     def _detect_loop(self):
         while True:
@@ -470,7 +571,7 @@ class FrameProcessor:
             lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist})")
         return "Detected objects:\n" + "\n".join(lines)
 
-    def get_pointcloud_binary(self, step=4, max_depth=6.0, fx=320, fy=320, cx=None, cy=None):
+    def get_pointcloud_binary(self, step=4, max_depth=6.0, fx=320, fy=320, cx=None, cy=None, world_frame: bool = True):
         """Generate a colored point cloud from depth + RGB.
 
         Returns bytes: N x 6 float32 array [x, y, z, r, g, b] (colors 0-1).
@@ -525,7 +626,16 @@ class FrameProcessor:
         x = (u - cx) * z / fx_d
         y = (v - cy) * z / fy_d
 
-        points = np.stack([x, -y, -z, r, g, b], axis=-1).astype(np.float32)
+        xyz_cam = np.stack([x, -y, -z], axis=-1).astype(np.float32)
+        if world_frame:
+            with self._lock:
+                world_T_cam = self._world_T_cam.copy()
+            R = world_T_cam[:3, :3].astype(np.float32)
+            t = world_T_cam[:3, 3].astype(np.float32)
+            xyz = (xyz_cam @ R.T) + t
+        else:
+            xyz = xyz_cam
+        points = np.concatenate([xyz, np.stack([r, g, b], axis=-1).astype(np.float32)], axis=-1).astype(np.float32)
         return points.tobytes()
 
 
@@ -1366,7 +1476,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">Open 3D View</a></div>
+    <div id="status"><span class="dot"></span>Listening... | Camera: live feed (left) | <a href="/3d" target="_blank" style="color:#4CAF50;">Point cloud</a> | <a href="/3d-mesh" target="_blank" style="color:#4CAF50;">TSDF mesh</a> (fused + edges)</div>
   </div>
 <script>
   const img = document.getElementById('feed');
@@ -1687,6 +1797,142 @@ window.addEventListener('resize', () => {
 </html>"""
 
 
+HTML_3D_MESH_PAGE = r"""<!DOCTYPE html>
+<html>
+<head>
+<title>TSDF Mesh — Fused 3D + Plane Edges</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0a0a; overflow:hidden; font-family:system-ui,sans-serif; }
+  canvas { display:block; }
+  #hud {
+    position:absolute; top:12px; left:12px; color:#eee; font-size:13px;
+    background:rgba(0,0,0,0.8); padding:10px 14px; border-radius:8px;
+    pointer-events:none; line-height:1.6;
+  }
+  #hud b { color:#4CAF50; }
+  #back-link {
+    position:absolute; bottom:12px; left:12px;
+    color:#4CAF50; font-size:13px; text-decoration:none;
+    background:rgba(0,0,0,0.8); padding:6px 12px; border-radius:6px;
+  }
+  #back-link:hover { text-decoration:underline; }
+  #no-mesh-msg {
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    color:#aaa; font-size:14px; text-align:center; max-width:360px;
+    background:rgba(0,0,0,0.85); padding:20px 24px; border-radius:10px;
+    pointer-events:none; line-height:1.6;
+  }
+  #no-mesh-msg.hidden { display:none; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>TSDF Mesh</b> — Fused 3D (smooth) + table/plane edges<br>
+  Frames integrated: <span id="integrations">0</span> · Triangles: <span id="triangles">0</span> · Planes: <span id="planes">0</span><br>
+  Drag to orbit · Scroll to zoom · Refreshes every 2s
+</div>
+<div id="no-mesh-msg">
+  No mesh yet.<br><br>
+  Connect the robot (<code>robot_client.py</code>) and ensure it is sending <b>both video and depth</b>. The server builds the 3D mesh from fused depth frames. If you use a ZED or OAK-D, configure the depth topic.
+</div>
+<a id="back-link" href="/">← Back to Control Panel</a>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 50);
+camera.position.set(2, 1.5, 2);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+const grid = new THREE.GridHelper(6, 12, 0x333333, 0x222222);
+scene.add(grid);
+scene.add(new THREE.AxesHelper(0.5));
+
+let meshGroup = new THREE.Group();
+let planeLinesGroup = new THREE.Group();
+scene.add(meshGroup);
+scene.add(planeLinesGroup);
+
+async function fetchAndRender() {
+  try {
+    const resp = await fetch('/tsdf-mesh');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const positions = data.positions || [];
+    const indices = data.indices || [];
+    const colors = data.colors || [];
+    const planes = data.planes || [];
+    const n = data.integrations || 0;
+
+    meshGroup.clear();
+    planeLinesGroup.clear();
+
+    const noMeshEl = document.getElementById('no-mesh-msg');
+    if (positions.length >= 9 && indices.length >= 3) {
+      noMeshEl.classList.add('hidden');
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
+      const colorArr = (colors.length === positions.length) ? new Float32Array(colors) : new Float32Array(positions.length).fill(0.7);
+      geom.setAttribute('color', new THREE.Float32BufferAttribute(colorArr, 3));
+      geom.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+      geom.computeVertexNormals();
+      const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(geom, mat);
+      meshGroup.add(mesh);
+      document.getElementById('triangles').textContent = Math.floor(indices.length / 3).toLocaleString();
+    } else {
+      noMeshEl.classList.remove('hidden');
+      document.getElementById('triangles').textContent = '0';
+    }
+
+    planes.forEach((boundary, i) => {
+      if (!boundary || boundary.length < 2) return;
+      const pts = boundary.flat();
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+      geom.setDrawRange(0, boundary.length);
+      const line = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: 0x00ff88 }));
+      planeLinesGroup.add(line);
+    });
+    document.getElementById('planes').textContent = planes.length;
+    document.getElementById('integrations').textContent = n;
+  } catch (e) {}
+  setTimeout(fetchAndRender, 2000);
+}
+fetchAndRender();
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>"""
+
+
 class WebHandler(BaseHTTPRequestHandler):
     frame_processor = None
     robot_controller = None
@@ -1762,6 +2008,21 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(HTML_3D_PAGE.encode())
+        elif self.path == '/3d-mesh':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_3D_MESH_PAGE.encode())
+        elif self.path == '/tsdf-mesh':
+            fp = self.frame_processor
+            if not fp:
+                self._json_response({'error': 'not ready'}, 503)
+                return
+            data = fp.get_tsdf_mesh_json()
+            if data is None:
+                self._json_response({'error': 'no tsdf data', 'positions': [], 'indices': [], 'colors': [], 'planes': [], 'integrations': 0}, 200)
+                return
+            self._json_response(data)
         else:
             self.send_error(404)
 
@@ -2042,6 +2303,8 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
                     frame_processor.on_depth_frame(payload)
                 elif msg_type == MSG_AUDIO_IN:
                     await audio_queue.put(payload)
+                elif msg_type == MSG_POSE:
+                    frame_processor.on_pose_frame(payload)
             # text messages from robot (status, etc.) — currently unused
     except Exception as e:
         print(f"[WS] Robot disconnected: {e}")
