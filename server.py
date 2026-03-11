@@ -47,6 +47,10 @@ except (ImportError, OSError):
 from google import genai
 from google.genai import types
 
+from occupancy_grid_2d import OccupancyGrid2D
+from object_map_2d import ObjectMap2D
+from object_tracker_2d import ObjectTracker2D
+
 # Audio config
 SEND_SAMPLE_RATE = 16000
 RECV_SAMPLE_RATE = 24000
@@ -58,6 +62,8 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03
+MSG_SLAM_GRID = 0x04
+MSG_SLAM_ODOM = 0x05
 # server -> robot
 MSG_AUDIO_OUT = 0x10
 
@@ -204,6 +210,244 @@ class FaceCache:
             return [{'name': e['name'], 'saved_at': e['saved_at']} for e in self.entries]
 
 
+# ── 2D Spatial Map (orchestrates occupancy grid + object map + tracker) ──────
+
+
+class SpatialMap2D:
+    """Combines OccupancyGrid2D, ObjectMap2D, and ObjectTracker2D.
+
+    Two modes of operation:
+    - **SLAM mode**: When the robot streams an RTAB-Map occupancy grid + visual
+      odometry, those are used directly (accurate, loop-closed).
+    - **Local mode** (fallback): Depth-projected occupancy grid with optional
+      dead-reckoning pose. Always runs so there's something to show even
+      without SLAM.
+    """
+
+    def __init__(self, fx=320.0, fy=320.0):
+        self.occ_grid = OccupancyGrid2D(size_m=10.0, resolution=0.05,
+                                        fx=fx, fy=fy, step=2)
+        self.obj_map = ObjectMap2D(fx=fx, fy=fy)
+        self.tracker = ObjectTracker2D()
+        self._lock = threading.Lock()
+        self._tracked = []
+        self._surfaces = []
+        self._grid = None
+        self._map_image = None
+
+        # SLAM state (from RTAB-Map / stereo VO via robot WebSocket)
+        self._slam_grid = None        # int8 numpy (h, w), -1=unknown, 0=free, 100=occupied
+        self._slam_grid_info = None   # (w, h, resolution, origin_x, origin_y)
+        self._slam_odom = None        # (x, y, z, qx, qy, qz, qw)
+        self._slam_active = False
+
+    def on_slam_grid(self, grid_np, w, h, res, ox, oy):
+        with self._lock:
+            self._slam_grid = grid_np
+            self._slam_grid_info = (w, h, res, ox, oy)
+            self._slam_active = True
+
+    def on_slam_odom(self, x, y, z, qx, qy, qz, qw):
+        with self._lock:
+            self._slam_odom = (x, y, z, qx, qy, qz, qw)
+            self._slam_active = True
+
+    def update(self, depth_map, detections, frame_shape=None, pose=None):
+        if depth_map is None:
+            return
+
+        with self._lock:
+            slam_active = self._slam_active
+            slam_grid = self._slam_grid
+            slam_info = self._slam_grid_info
+            slam_odom = self._slam_odom
+
+        if slam_active and slam_grid is not None:
+            self._update_slam_mode(slam_grid, slam_info, slam_odom,
+                                   detections, depth_map, frame_shape)
+        else:
+            self._update_local_mode(depth_map, detections, frame_shape, pose)
+
+    def _update_slam_mode(self, slam_grid, slam_info, slam_odom,
+                          detections, depth_map, frame_shape):
+        """Use RTAB-Map grid as the base map, overlay YOLO labels."""
+        w, h, res, ox, oy = slam_info
+
+        # Convert SLAM grid (-1=unknown, 0=free, 100=occ) to our format
+        from occupancy_grid_2d import UNKNOWN, FREE, OCCUPIED
+        grid = np.full((h, w), UNKNOWN, dtype=np.uint8)
+        grid[slam_grid == 0] = FREE
+        grid[slam_grid >= 50] = OCCUPIED
+
+        # Extract contours from the SLAM grid
+        occ_mask = (grid == OCCUPIED).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c for c in contours if cv2.contourArea(c) >= 4.0]
+        surface_rects = [cv2.minAreaRect(c) for c in contours
+                         if cv2.contourArea(c) >= 20.0 and len(c) >= 5]
+
+        # Robot position from odom
+        robot_col, robot_row = w // 2, h // 2
+        if slam_odom is not None:
+            rx, ry = slam_odom[0], slam_odom[1]
+            robot_col = int((rx - ox) / res)
+            robot_row = int(h - 1 - (ry - oy) / res)
+            robot_col = max(0, min(w - 1, robot_col))
+            robot_row = max(0, min(h - 1, robot_row))
+
+        # Project YOLO labels (using the local depth for depth-per-detection)
+        map_objs = self.obj_map.update(
+            detections, depth_map, frame_shape=frame_shape,
+            surface_rects=surface_rects,
+            grid_resolution=res,
+            grid_origin_col=robot_col,
+            grid_origin_row=robot_row,
+        )
+        tracked = self.tracker.update(map_objs)
+
+        # Render
+        img = np.full((h, w, 3), 30, dtype=np.uint8)
+        img[grid == FREE] = [50, 50, 50]
+        img[grid == OCCUPIED] = [80, 80, 80]
+        if contours:
+            cv2.drawContours(img, contours, -1, (0, 255, 0), 1)
+        for rect in surface_rects:
+            box = cv2.boxPoints(rect)
+            box = np.intp(box)
+            cv2.drawContours(img, [box], 0, (0, 220, 220), 1)
+        cv2.circle(img, (robot_col, robot_row), 4, (0, 0, 255), -1)
+
+        # Draw tracked YOLO objects
+        for obj in tracked:
+            cx = int(obj['center_x'] / res + robot_col)
+            cz = int(robot_row - obj['center_z'] / res)
+            hw = max(2, int(obj['width'] / res / 2))
+            hl = max(2, int(obj['length'] / res / 2))
+            color = _slam_class_color(obj.get('class', ''))
+            r1 = max(0, min(h - 1, cz - hl))
+            r2 = max(0, min(h - 1, cz + hl))
+            c1 = max(0, min(w - 1, cx - hw))
+            c2 = max(0, min(w - 1, cx + hw))
+            cv2.rectangle(img, (c1, r1), (c2, r2), color, 1)
+            label = obj.get('name') or obj.get('class', '')
+            tid = obj.get('track_id')
+            if tid is not None:
+                label = f"#{tid} {label}"
+            cv2.putText(img, label, (c1, max(r1 - 3, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
+
+        # Build surface list in metres
+        surfaces = []
+        for rect in surface_rects:
+            (cc, cr), (w_px, h_px), angle = rect
+            cx_m = (cc - robot_col) * res
+            cz_m = (robot_row - cr) * res
+            w_m = w_px * res
+            h_m = h_px * res
+            surfaces.append({
+                'center_x': round(cx_m, 3), 'center_z': round(cz_m, 3),
+                'width': round(w_m, 3), 'length': round(h_m, 3),
+                'angle_deg': round(angle, 1), 'area_m2': round(w_m * h_m, 4),
+            })
+
+        with self._lock:
+            self._grid = grid.copy()
+            self._tracked = list(tracked)
+            self._surfaces = surfaces
+            self._map_image = img
+
+    def _update_local_mode(self, depth_map, detections, frame_shape, pose):
+        """Fallback: use local depth-projected grid + dead-reckoning."""
+        grid = self.occ_grid.update(depth_map, pose=pose)
+        map_objs = self.obj_map.update(
+            detections, depth_map, frame_shape=frame_shape,
+            surface_rects=self.occ_grid.surface_rects,
+            grid_resolution=self.occ_grid.resolution,
+            grid_origin_col=self.occ_grid.origin_col,
+            grid_origin_row=self.occ_grid.origin_row,
+        )
+        tracked = self.tracker.update(map_objs)
+        surfaces = self.occ_grid.get_surface_list()
+        img = self.occ_grid.render(tracked, robot_pose=pose)
+
+        with self._lock:
+            self._grid = grid.copy()
+            self._tracked = list(tracked)
+            self._surfaces = surfaces
+            self._map_image = img
+
+    def get_image_jpeg(self, scale=3):
+        with self._lock:
+            img = self._map_image
+        if img is None:
+            return None
+        if scale != 1:
+            h, w = img.shape[:2]
+            img = cv2.resize(img, (w * scale, h * scale),
+                             interpolation=cv2.INTER_NEAREST)
+        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return buf.tobytes()
+
+    def get_json(self):
+        with self._lock:
+            tracked = list(self._tracked)
+            surfaces = list(self._surfaces)
+            grid = self._grid
+            slam_active = self._slam_active
+            slam_info = self._slam_grid_info
+        objects = []
+        for t in tracked:
+            objects.append({
+                'track_id': t['track_id'],
+                'class': t['class'],
+                'name': t.get('name'),
+                'center_x': round(t['center_x'], 3),
+                'center_z': round(t['center_z'], 3),
+                'width': round(t['width'], 3),
+                'length': round(t['length'], 3),
+                'distance': round(t.get('distance', 0), 2),
+                'velocity_x': round(t.get('velocity_x', 0), 3),
+                'velocity_z': round(t.get('velocity_z', 0), 3),
+            })
+        grid_meta = None
+        if grid is not None:
+            if slam_active and slam_info is not None:
+                w, h, res, ox, oy = slam_info
+                odom = self._slam_odom
+                rc = int((odom[0] - ox) / res) if odom else w // 2
+                rr = int(h - 1 - (odom[1] - oy) / res) if odom else h // 2
+                grid_meta = {
+                    'size': max(grid.shape),
+                    'resolution': res,
+                    'origin_col': rc,
+                    'origin_row': rr,
+                    'slam': True,
+                }
+            else:
+                grid_meta = {
+                    'size': grid.shape[0],
+                    'resolution': self.occ_grid.resolution,
+                    'origin_col': self.occ_grid.origin_col,
+                    'origin_row': self.occ_grid.origin_row,
+                    'slam': False,
+                }
+        return {'objects': objects, 'surfaces': surfaces, 'grid': grid_meta}
+
+
+def _slam_class_color(cls):
+    palette = {
+        'person': (0, 180, 255), 'chair': (255, 120, 0),
+        'couch': (180, 0, 255), 'bed': (0, 200, 120),
+        'dining table': (200, 200, 0), 'tv': (255, 0, 0),
+        'laptop': (0, 255, 200), 'wall': (200, 200, 200),
+        'surface': (0, 220, 220),
+    }
+    return palette.get(cls, (0, 200, 0))
+
+
 # ── Frame Processor (replaces CameraDetectionNode — no ROS2 needed) ─────────
 
 
@@ -234,6 +478,9 @@ class FrameProcessor:
         self._fps_counter = 0
         self._fps_time = time.time()
 
+        self.spatial_map = SpatialMap2D(fx=320.0, fy=320.0)
+        self._robot_controller = None  # set later for dead-reckoning pose
+
         self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self._pending_frame = None
         self._detect_event = threading.Event()
@@ -255,6 +502,25 @@ class FrameProcessor:
             self._depth_map = depth
         except Exception as e:
             print(f"Depth decode error: {e}")
+
+    def on_slam_grid(self, data):
+        """Decode SLAM occupancy grid from robot WebSocket."""
+        try:
+            w, h = struct.unpack('<HH', data[:4])
+            res, ox, oy = struct.unpack('<fff', data[4:16])
+            raw = zlib.decompress(data[16:])
+            grid = np.frombuffer(raw, dtype=np.int8).reshape((h, w))
+            self.spatial_map.on_slam_grid(grid, w, h, res, ox, oy)
+        except Exception as e:
+            print(f"SLAM grid decode error: {e}")
+
+    def on_slam_odom(self, data):
+        """Decode SLAM visual odometry pose from robot WebSocket."""
+        try:
+            x, y, z, qx, qy, qz, qw = struct.unpack('<7f', data[:28])
+            self.spatial_map.on_slam_odom(x, y, z, qx, qy, qz, qw)
+        except Exception as e:
+            print(f"SLAM odom decode error: {e}")
 
     def _detect_loop(self):
         while True:
@@ -355,9 +621,23 @@ class FrameProcessor:
             self._fps_counter = 0
             self._fps_time = now
 
+        if depth_available:
+            try:
+                rc = self._robot_controller
+                pose = None
+                if rc is not None and rc._last_move_time is not None:
+                    pose = (rc.pose_x, rc.pose_y, rc.pose_theta)
+                self.spatial_map.update(
+                    self._depth_map, detections,
+                    frame_shape=self._frame_shape, pose=pose)
+            except Exception as e:
+                print(f"Spatial map error: {e}")
+
         faces_str = f"Faces: {len(self._cached_face_results)}" if self.enable_faces else "Faces: off"
         depth_str = "Depth: ON" if depth_available else "Depth: waiting..."
-        status = f"FPS: {self._fps:.0f} | Objects: {len(detections)} | {faces_str} | {depth_str}"
+        n_tracked = len(self.spatial_map._tracked)
+        n_surfaces = len(self.spatial_map._surfaces)
+        status = f"FPS: {self._fps:.0f} | Det: {len(detections)} | Surfaces: {n_surfaces} | Tracked: {n_tracked} | {faces_str} | {depth_str}"
         cv2.putText(annotated, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
 
         with self._lock:
@@ -548,12 +828,20 @@ class RobotController:
 
         self.frame_processor = None
 
+        # Dead-reckoning pose estimate (x forward, y left, theta radians)
+        self.pose_x = 0.0
+        self.pose_y = 0.0
+        self.pose_theta = 0.0
+        self._last_move_time = None
+
     def set_connection(self, ws, loop):
         self._ws = ws
         self._loop = loop
 
     def set_frame_processor(self, fp: FrameProcessor):
         self.frame_processor = fp
+        if fp is not None:
+            fp._robot_controller = self
 
     def _send(self, cmd_dict):
         ws, loop = self._ws, self._loop
@@ -577,6 +865,13 @@ class RobotController:
     # ── Movement ─────────────────────────────────────────────────────────
 
     def _move(self, x, y, yaw):
+        now = time.time()
+        if self._last_move_time is not None:
+            dt = min(now - self._last_move_time, 0.2)
+            self.pose_theta += yaw * dt
+            self.pose_x += x * math.cos(self.pose_theta) * dt
+            self.pose_y += x * math.sin(self.pose_theta) * dt
+        self._last_move_time = now
         self._send({'cmd': 'move', 'x': x, 'y': y, 'yaw': yaw})
 
     def move_timed(self, x, y, yaw, duration):
@@ -1357,7 +1652,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">Open 3D View</a></div>
+    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">3D View</a> | <a href="/map2d" target="_blank" style="color:#4CAF50;">2D Map</a></div>
   </div>
 <script>
   const img = document.getElementById('feed');
@@ -1677,6 +1972,200 @@ window.addEventListener('resize', () => {
 </body>
 </html>"""
 
+HTML_MAP2D_PAGE = r"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>2D Spatial Map</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#111; color:#eee; font-family:system-ui,sans-serif;
+         display:flex; flex-direction:column; align-items:center; height:100vh; }
+  h1 { font-size:1.1rem; padding:8px 0 2px; color:#888; }
+  #controls { display:flex; gap:14px; align-items:center; padding:4px 0 6px;
+              font-size:0.82rem; color:#999; flex-wrap:wrap; justify-content:center; }
+  #controls label { display:flex; align-items:center; gap:4px; }
+  #controls button { background:#333; color:#ccc; border:1px solid #555;
+                     padding:3px 10px; border-radius:4px; cursor:pointer; font-size:0.8rem; }
+  #controls button:hover { background:#555; }
+  #map-wrap { position:relative; flex:1; display:flex; justify-content:center;
+              align-items:center; overflow:hidden; }
+  canvas { image-rendering:pixelated; }
+  #overlay { position:absolute; top:0; left:0; pointer-events:none; }
+  #info { padding:6px 12px; font-size:0.78rem; color:#777; max-height:180px;
+          overflow-y:auto; width:100%; }
+  .section-hdr { color:#555; font-size:0.7rem; text-transform:uppercase;
+                 letter-spacing:1px; padding:4px 0 2px; }
+  .obj-row { display:flex; gap:8px; padding:2px 0; border-bottom:1px solid #222; flex-wrap:wrap; }
+  .obj-class { font-weight:600; min-width:100px; }
+  .obj-pos { color:#6cf; }
+  .obj-size { color:#fc6; }
+  .obj-vel { color:#c6f; }
+  .surf-row { display:flex; gap:8px; padding:1px 0; border-bottom:1px solid #1a1a1a; color:#5a8; font-size:0.75rem; }
+</style>
+</head><body>
+<h1>2D Spatial Map &mdash; Floor Plan from Depth</h1>
+<div id="controls">
+  <label>Refresh
+    <select id="fps-sel">
+      <option value="200">5 fps</option>
+      <option value="400" selected>2.5 fps</option>
+      <option value="1000">1 fps</option>
+    </select>
+  </label>
+  <label>Scale
+    <select id="scale-sel">
+      <option value="2">2x</option>
+      <option value="3" selected>3x</option>
+      <option value="4">4x</option>
+    </select>
+  </label>
+  <button onclick="resetMap()">Reset Map</button>
+  <span id="status-txt">Connecting...</span>
+</div>
+<div id="map-wrap">
+  <canvas id="map-canvas"></canvas>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="info"></div>
+<script>
+const canvas = document.getElementById('map-canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+const statusTxt = document.getElementById('status-txt');
+const infoDiv = document.getElementById('info');
+const fpsSel = document.getElementById('fps-sel');
+const scaleSel = document.getElementById('scale-sel');
+
+let refreshMs = parseInt(fpsSel.value);
+fpsSel.onchange = () => { refreshMs = parseInt(fpsSel.value); };
+
+const classColors = {
+  person:'#00b4ff', chair:'#ff7800', couch:'#b400ff', bed:'#00c878',
+  'dining table':'#c8c800', tv:'#ff0000', laptop:'#00ffc8',
+  wall:'#8f8', surface:'#0dc', object:'#aaa',
+};
+function colorFor(cls) { return classColors[cls] || '#0c0'; }
+
+let mapImg = new Image();
+let objects = [];
+let surfaces = [];
+let gridMeta = null;
+
+async function fetchMap() {
+  try {
+    const [imgResp, jsonResp] = await Promise.all([
+      fetch('/map2d/image'),
+      fetch('/map2d/json'),
+    ]);
+    if (imgResp.ok) {
+      const blob = await imgResp.blob();
+      mapImg.src = URL.createObjectURL(blob);
+    }
+    if (jsonResp.ok) {
+      const data = await jsonResp.json();
+      objects = data.objects || [];
+      surfaces = data.surfaces || [];
+      gridMeta = data.grid;
+    }
+    const mode = (gridMeta && gridMeta.slam) ? 'SLAM' : 'Local depth';
+    statusTxt.textContent = `[${mode}] ${surfaces.length} surfaces | ${objects.length} tracked objects`;
+  } catch(e) {
+    statusTxt.textContent = 'Connection lost...';
+  }
+  setTimeout(fetchMap, refreshMs);
+}
+
+function resetMap() {
+  fetch('/map2d/reset', {method:'POST'}).catch(()=>{});
+}
+
+mapImg.onload = () => {
+  const w = mapImg.naturalWidth, h = mapImg.naturalHeight;
+  canvas.width = w; canvas.height = h;
+  overlay.width = w; overlay.height = h;
+  canvas.style.width = w+'px'; canvas.style.height = h+'px';
+  overlay.style.width = w+'px'; overlay.style.height = h+'px';
+  ctx.drawImage(mapImg, 0, 0);
+  drawOverlay();
+  renderInfo();
+  URL.revokeObjectURL(mapImg.src);
+};
+
+function drawOverlay() {
+  const w = overlay.width, h = overlay.height;
+  octx.clearRect(0, 0, w, h);
+  if (!gridMeta) return;
+  const res = gridMeta.resolution;
+  const oc = gridMeta.origin_col;
+  const or_ = gridMeta.origin_row;
+  const sc = parseInt(scaleSel.value) || 3;
+  const cellPx = sc;
+
+  for (const obj of objects) {
+    const cx = (obj.center_x / res + oc) * cellPx;
+    const cz = (or_ - obj.center_z / res) * cellPx;
+    const hw = Math.max(cellPx, (obj.width / res / 2) * cellPx);
+    const hl = Math.max(cellPx, (obj.length / res / 2) * cellPx);
+    const color = colorFor(obj['class']);
+
+    octx.strokeStyle = color;
+    octx.lineWidth = 2;
+    octx.strokeRect(cx - hw, cz - hl, hw * 2, hl * 2);
+
+    let label = obj['class'];
+    if (obj.name) label = obj.name;
+    if (obj.track_id != null) label = '#' + obj.track_id + ' ' + label;
+    if (obj.distance != null) label += ' ' + obj.distance.toFixed(1) + 'm';
+    octx.font = '10px system-ui';
+    octx.fillStyle = color;
+    octx.fillText(label, cx - hw, cz - hl - 3);
+
+    if (obj.velocity_x != null && (Math.abs(obj.velocity_x) > 0.05 || Math.abs(obj.velocity_z) > 0.05)) {
+      octx.beginPath();
+      octx.moveTo(cx, cz);
+      octx.lineTo(cx + obj.velocity_x * 20 * cellPx, cz - obj.velocity_z * 20 * cellPx);
+      octx.strokeStyle = '#ff0';
+      octx.lineWidth = 1.5;
+      octx.stroke();
+    }
+  }
+}
+
+function renderInfo() {
+  let html = '';
+  if (surfaces.length) {
+    html += '<div class="section-hdr">Solid Surfaces (from depth)</div>';
+    for (const s of surfaces) {
+      html += `<div class="surf-row">
+        <span>${s.width.toFixed(2)}m x ${s.length.toFixed(2)}m</span>
+        <span>at (${s.center_x.toFixed(2)}, ${s.center_z.toFixed(2)})</span>
+        <span>${s.angle_deg.toFixed(0)}&deg;</span>
+        <span>${s.area_m2.toFixed(2)}m&sup2;</span>
+      </div>`;
+    }
+  }
+  if (objects.length) {
+    html += '<div class="section-hdr">Tracked Objects</div>';
+    for (const o of objects) {
+      html += `<div class="obj-row">
+        <span class="obj-class" style="color:${colorFor(o['class'])}">#${o.track_id} ${o.name||o['class']}</span>
+        <span class="obj-pos">pos(${o.center_x.toFixed(2)}, ${o.center_z.toFixed(2)})</span>
+        <span class="obj-size">${o.width.toFixed(2)}&times;${o.length.toFixed(2)}m</span>
+        <span>${o.distance.toFixed(1)}m</span>
+      </div>`;
+    }
+  }
+  if (!surfaces.length && !objects.length) {
+    html = '<span style="color:#444">Waiting for depth data...</span>';
+  }
+  infoDiv.innerHTML = html;
+}
+
+fetchMap();
+</script>
+</body></html>"""
+
 
 class WebHandler(BaseHTTPRequestHandler):
     frame_processor = None
@@ -1753,12 +2242,48 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(HTML_3D_PAGE.encode())
+        elif self.path == '/map2d':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_MAP2D_PAGE.encode())
+        elif self.path.startswith('/map2d/image'):
+            fp = self.frame_processor
+            if not fp:
+                self.send_error(503, 'Not ready')
+                return
+            jpeg = fp.spatial_map.get_image_jpeg(scale=3)
+            if jpeg is None:
+                self.send_error(503, 'No map data')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(jpeg)
+        elif self.path == '/map2d/json':
+            fp = self.frame_processor
+            if not fp:
+                self.send_error(503, 'Not ready')
+                return
+            data = fp.spatial_map.get_json()
+            self._json_response(data)
         else:
             self.send_error(404)
 
     def do_POST(self):
         fp = self.frame_processor
         robot = self.robot_controller
+
+        if self.path == '/map2d/reset':
+            if fp:
+                fp.spatial_map.occ_grid.clear()
+            if robot:
+                robot.pose_x = robot.pose_y = robot.pose_theta = 0.0
+                robot._last_move_time = None
+            self._json_response({'ok': True})
+            return
+
         try:
             body = json.loads(self._read_body())
         except Exception:
@@ -2033,6 +2558,10 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
                     frame_processor.on_depth_frame(payload)
                 elif msg_type == MSG_AUDIO_IN:
                     await audio_queue.put(payload)
+                elif msg_type == MSG_SLAM_GRID:
+                    frame_processor.on_slam_grid(payload)
+                elif msg_type == MSG_SLAM_ODOM:
+                    frame_processor.on_slam_odom(payload)
             # text messages from robot (status, etc.) — currently unused
     except Exception as e:
         print(f"[WS] Robot disconnected: {e}")

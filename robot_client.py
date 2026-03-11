@@ -29,6 +29,7 @@ import websockets
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
+from nav_msgs.msg import OccupancyGrid, Odometry
 from cv_bridge import CvBridge
 
 from booster_robotics_sdk_python import (
@@ -46,6 +47,8 @@ AUDIO_CHUNK = 1024
 MSG_VIDEO = 0x01
 MSG_DEPTH = 0x02
 MSG_AUDIO_IN = 0x03  # robot mic -> server
+MSG_SLAM_GRID = 0x04  # occupancy grid from SLAM
+MSG_SLAM_ODOM = 0x05  # visual odometry pose from SLAM
 
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
@@ -67,6 +70,20 @@ class CameraStreamer(Node):
         self.create_subscription(Image, '/image_left_raw', self._on_image, 10)
         self.create_subscription(CompressedImage, '/booster_video_stream', self._on_compressed, 10)
         self.create_subscription(Image, '/StereoNetNode/stereonet_depth', self._on_depth, 10)
+
+        # SLAM outputs (from rtabmap_slam.py or RTAB-Map directly)
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+        slam_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
+        self.create_subscription(OccupancyGrid, '/k1_slam/map', self._on_slam_grid, slam_qos)
+        self.create_subscription(OccupancyGrid, '/rtabmap/grid_map', self._on_slam_grid, slam_qos)
+        self.create_subscription(Odometry, '/k1_slam/odom', self._on_slam_odom, 10)
+        self.create_subscription(Odometry, '/rtabmap/odom', self._on_slam_odom, 10)
+        self._slam_grid_compressed = None
+        self._slam_odom_packed = None
+        self._new_slam_grid = threading.Event()
+        self._new_slam_odom = threading.Event()
 
     def _on_image(self, msg):
         try:
@@ -119,6 +136,33 @@ class CameraStreamer(Node):
         except Exception as e:
             self.get_logger().error(f'Depth error: {e}')
 
+    def _on_slam_grid(self, msg):
+        try:
+            w = msg.info.width
+            h = msg.info.height
+            res = msg.info.resolution
+            ox = msg.info.origin.position.x
+            oy = msg.info.origin.position.y
+            grid_data = np.array(msg.data, dtype=np.int8)
+            header = struct.pack('<HHfff', w, h, res, ox, oy)
+            compressed = zlib.compress(grid_data.tobytes(), level=1)
+            with self._lock:
+                self._slam_grid_compressed = header + compressed
+            self._new_slam_grid.set()
+        except Exception as e:
+            self.get_logger().error(f'SLAM grid error: {e}')
+
+    def _on_slam_odom(self, msg):
+        try:
+            p = msg.pose.pose.position
+            q = msg.pose.pose.orientation
+            packed = struct.pack('<7f', p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+            with self._lock:
+                self._slam_odom_packed = packed
+            self._new_slam_odom.set()
+        except Exception as e:
+            self.get_logger().error(f'SLAM odom error: {e}')
+
     def take_frame(self):
         self._new_frame.clear()
         with self._lock:
@@ -128,6 +172,16 @@ class CameraStreamer(Node):
         self._new_depth.clear()
         with self._lock:
             return self._depth_compressed
+
+    def take_slam_grid(self):
+        self._new_slam_grid.clear()
+        with self._lock:
+            return self._slam_grid_compressed
+
+    def take_slam_odom(self):
+        self._new_slam_odom.clear()
+        with self._lock:
+            return self._slam_odom_packed
 
 
 # ── Robot Command Executor ──────────────────────────────────────────────────
@@ -483,6 +537,7 @@ async def run_client(args, camera: CameraStreamer, executor: RobotExecutor):
                     asyncio.create_task(_stream_video(ws, camera, args.fps)),
                     asyncio.create_task(_stream_depth(ws, camera, args.depth_fps)),
                     asyncio.create_task(_stream_audio(ws, pya, mic_device, args.mic_gain)),
+                    asyncio.create_task(_stream_slam(ws, camera)),
                     asyncio.create_task(_receive_commands(ws, executor, pya)),
                 ]
                 try:
@@ -518,6 +573,21 @@ async def _stream_depth(ws, camera: CameraStreamer, fps):
             if data:
                 await ws.send(bytes([MSG_DEPTH]) + data)
             await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _stream_slam(ws, camera: CameraStreamer):
+    """Stream SLAM occupancy grid + odom to the server."""
+    try:
+        while True:
+            grid = camera.take_slam_grid()
+            if grid:
+                await ws.send(bytes([MSG_SLAM_GRID]) + grid)
+            odom = camera.take_slam_odom()
+            if odom:
+                await ws.send(bytes([MSG_SLAM_ODOM]) + odom)
+            await asyncio.sleep(0.5)
     except asyncio.CancelledError:
         pass
 
