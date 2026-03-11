@@ -1,0 +1,7 @@
+# For run_high_quality_recon.py --backend native (Mac)
+torch>=1.9
+torchvision>=0.10
+open3d>=0.15
+scipy>=1.7
+numpy>=1.21
+Pillow>=9.0

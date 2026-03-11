@@ -119,6 +119,17 @@ pip install websockets
 python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090
 ```
 
+**Using a ZED camera on the robot:**  
+Start the ZED ROS2 driver (e.g. `zed_wrapper`), then run the client with ZED topics so the server gets ZED video and depth:
+
+```bash
+python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090 \
+  --image-topic /zed2i/zed_node/left/image_rect_color \
+  --depth-topic /zed2i/zed_node/depth/depth_registered
+```
+
+Use your ZED node’s namespace if different (e.g. `/zed/zed_node/...`). The server receives the stream the same way and shows it in the web UI.
+
 ### Server Arguments
 
 ```

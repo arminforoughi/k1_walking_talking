@@ -5,7 +5,13 @@ Streams camera + depth + audio to a remote server via WebSocket.
 Receives and executes control commands.
 
 Usage:
+    # Default (K1 / StereoNet camera topics)
     python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090
+
+    # ZED camera: use ZED ROS2 topic names
+    python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090 \\
+        --image-topic /zed2i/zed_node/left/image_rect_color \\
+        --depth-topic /zed2i/zed_node/depth/depth_registered
 """
 
 import os
@@ -54,7 +60,7 @@ MSG_AUDIO_IN = 0x03  # robot mic -> server
 class CameraStreamer(Node):
     """ROS2 node: subscribes to camera + depth, buffers latest frames."""
 
-    def __init__(self):
+    def __init__(self, image_topic: str = None, depth_topic: str = None):
         super().__init__('robot_stream_client')
         self.bridge = CvBridge()
         self._lock = threading.Lock()
@@ -64,9 +70,15 @@ class CameraStreamer(Node):
         self._new_depth = threading.Event()
         self._raw_frame = None
 
-        self.create_subscription(Image, '/image_left_raw', self._on_image, 10)
-        self.create_subscription(CompressedImage, '/booster_video_stream', self._on_compressed, 10)
-        self.create_subscription(Image, '/StereoNetNode/stereonet_depth', self._on_depth, 10)
+        # Default: K1 / StereoNet; override with --image-topic / --depth-topic for ZED
+        img1 = image_topic or '/image_left_raw'
+        img2 = '/booster_video_stream' if not image_topic else None
+        dep = depth_topic or '/StereoNetNode/stereonet_depth'
+
+        self.create_subscription(Image, img1, self._on_image, 10)
+        if img2:
+            self.create_subscription(CompressedImage, img2, self._on_compressed, 10)
+        self.create_subscription(Image, dep, self._on_depth, 10)
 
     def _on_image(self, msg):
         try:
@@ -106,6 +118,10 @@ class CameraStreamer(Node):
         try:
             if msg.encoding == 'mono16':
                 depth = np.frombuffer(msg.data, dtype=np.uint16).reshape((msg.height, msg.width))
+            elif msg.encoding == '32FC1':
+                # ZED depth is often float32 meters
+                depth_f = np.frombuffer(msg.data, dtype=np.float32).reshape((msg.height, msg.width))
+                depth = (np.clip(depth_f, 0, 65.0) * 1000.0).astype(np.uint16)  # m -> mm
             else:
                 depth = self.bridge.imgmsg_to_cv2(msg)
             h, w = depth.shape
@@ -583,6 +599,10 @@ def main():
                         help='WebSocket server URL (e.g. ws://192.168.1.100:9090)')
     parser.add_argument('--fps', type=int, default=10, help='Video stream FPS')
     parser.add_argument('--depth-fps', type=int, default=5, help='Depth stream FPS')
+    parser.add_argument('--image-topic', type=str, default=None,
+                        help='ROS2 image topic (e.g. /zed2i/zed_node/left/image_rect_color for ZED)')
+    parser.add_argument('--depth-topic', type=str, default=None,
+                        help='ROS2 depth topic (e.g. /zed2i/zed_node/depth/depth_registered for ZED)')
     parser.add_argument('--mic-gain', type=float, default=3.0, help='Mic gain multiplier')
     parser.add_argument('--mic-device', type=int, default=None, help='PyAudio mic device index')
     args = parser.parse_args()
@@ -611,7 +631,10 @@ def main():
 
     # ROS2
     rclpy.init()
-    camera = CameraStreamer()
+    camera = CameraStreamer(
+        image_topic=args.image_topic,
+        depth_topic=args.depth_topic,
+    )
     ros_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
     ros_thread.start()
 

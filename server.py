@@ -9,6 +9,15 @@ Usage:
     export GEMINI_API_KEY="your-key"
     python3 server.py
     python3 server.py --voice Charon --no-faces --port 8080
+
+Getting footage from the robot ZED camera:
+    1. On your machine (server):  python3 server.py
+    2. On the robot: start ZED ROS2 node (e.g. zed_wrapper), then:
+       python3 robot_client.py eth0 --server ws://<SERVER_IP>:9090 \\
+         --image-topic /zed2i/zed_node/left/image_rect_color \\
+         --depth-topic /zed2i/zed_node/depth/depth_registered
+    3. Replace <SERVER_IP> with your laptop's IP and eth0 with the robot's network interface.
+    4. Server WebSocket listens on port 9090 by default (--ws-port).
 """
 
 import os

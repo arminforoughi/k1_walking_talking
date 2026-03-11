@@ -1,0 +1,15 @@
+# Vision pipeline dependencies
+numpy>=1.21
+opencv-python>=4.5
+scipy>=1.7
+ultralytics>=8.0
+torch>=1.9
+torchvision>=0.10
+transformers>=4.30
+Pillow>=9.0
+
+# Optional: ZED camera (install separately if using ZED)
+# pip install pyzed
+
+# Optional: OAK-D camera (Luxonis) — needs 2.24+ for pipeline.start() / getDefaultDevice()
+# pip install "depthai>=2.24"
