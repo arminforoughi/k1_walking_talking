@@ -243,6 +243,8 @@ class FrameProcessor:
         self._fps = 0.0
         self._fps_counter = 0
         self._fps_time = time.time()
+        self._depth_frames = 0
+        self._last_depth_time = 0.0
 
         self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self._pending_frame = None
@@ -274,6 +276,8 @@ class FrameProcessor:
             raw = zlib.decompress(data[4:])
             depth = np.frombuffer(raw, dtype=np.uint16).reshape((h, w))
             self._depth_map = depth
+            self._depth_frames += 1
+            self._last_depth_time = time.time()
             # Integrate into TSDF when we have both depth and RGB (for /3d-mesh viewer)
             with self._lock:
                 raw_frame = self._raw_frame
@@ -316,7 +320,8 @@ class FrameProcessor:
         try:
             with self._lock:
                 if self._tsdf is None:
-                    self._tsdf = LiveTSDF(voxel_size=0.02, depth_scale=1.0 / 1000.0, depth_min=0.2, depth_max=5.0)
+                    # We pass depth in meters (float32), so keep depth_scale=1.0.
+                    self._tsdf = LiveTSDF(voxel_size=0.02, depth_scale=1.0, depth_min=0.2, depth_max=5.0)
                 dh, dw = depth_uint16.shape
                 depth_m = depth_uint16.astype(np.float32) / 1000.0  # mm -> meters
                 rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
@@ -1988,6 +1993,50 @@ class WebHandler(BaseHTTPRequestHandler):
             robot = self.robot_controller
             connected = robot is not None and robot._ws is not None
             self._json_response({'connected': connected})
+        elif self.path == '/debug_state':
+            fp = self.frame_processor
+            robot = self.robot_controller
+            connected = robot is not None and robot._ws is not None
+            if not fp:
+                self._json_response({'connected': connected, 'ready': False}, 200)
+                return
+            with fp._lock:
+                tsdf_integrations = int(fp._tsdf_integrations)
+                tsdf_disabled = bool(fp._tsdf_disabled)
+                has_rgb = fp._raw_frame is not None
+                has_depth = fp._depth_map is not None
+                depth_map = fp._depth_map.copy() if fp._depth_map is not None else None
+                pose_age_s = (time.time() - fp._pose_timestamp) if fp._pose_timestamp else None
+                depth_age_s = (time.time() - fp._last_depth_time) if fp._last_depth_time else None
+                world_T_cam = fp._world_T_cam.copy()
+            depth_stats = None
+            if depth_map is not None:
+                dm = depth_map.astype(np.float32)
+                nz = dm[dm > 0]
+                if nz.size:
+                    depth_stats = {
+                        "depth_mm_min": float(nz.min()),
+                        "depth_mm_max": float(nz.max()),
+                        "depth_mm_p50": float(np.percentile(nz, 50)),
+                        "depth_nonzero_frac": float(nz.size / dm.size),
+                    }
+                else:
+                    depth_stats = {
+                        "depth_nonzero_frac": 0.0,
+                    }
+            self._json_response({
+                'connected': connected,
+                'ready': True,
+                'has_rgb': has_rgb,
+                'has_depth': has_depth,
+                'depth_frames': int(getattr(fp, "_depth_frames", 0)),
+                'depth_age_s': depth_age_s,
+                'pose_age_s': pose_age_s,
+                'tsdf_disabled': tsdf_disabled,
+                'tsdf_integrations': tsdf_integrations,
+                'depth_stats': depth_stats,
+                'world_T_cam': world_T_cam.tolist(),
+            }, 200)
         elif self.path.startswith('/pointcloud'):
             fp = self.frame_processor
             if not fp:
@@ -2321,12 +2370,12 @@ async def run_server(args):
     global _frame_processor_ref, _cmd_dispatcher_ref, _session_ref, _event_loop_ref
 
     api_key = args.api_key or os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        print("Error: provide --api-key or set GEMINI_API_KEY env variable")
-        sys.exit(1)
-
-    os.environ.pop('GOOGLE_API_KEY', None)
-    os.environ.pop('GEMINI_API_KEY', None)
+    if api_key:
+        # Avoid leaking key to subprocesses / logs.
+        os.environ.pop('GOOGLE_API_KEY', None)
+        os.environ.pop('GEMINI_API_KEY', None)
+    else:
+        print("Note: no Gemini API key provided; running without Gemini Live (chat/audio disabled).")
 
     face_cache = None
     if not args.no_faces and face_recognition is not None:
@@ -2370,6 +2419,18 @@ async def run_server(args):
     )
     print(f"Robot WebSocket: ws://0.0.0.0:{args.ws_port}")
     print(f"  Tell robot_client.py to connect to: ws://<THIS_IP>:{args.ws_port}")
+
+    if not api_key:
+        # Run web + robot ws only.
+        _event_loop_ref = asyncio.get_event_loop()
+        print("Waiting for robot to connect...")
+        print("Press Ctrl+C to stop.\n")
+        try:
+            await asyncio.Future()
+        finally:
+            ws_server.close()
+            robot.shutdown()
+        return
 
     # Gemini session
     client = genai.Client(api_key=api_key)
