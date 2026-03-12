@@ -1,8 +1,8 @@
 """2D bird's-eye occupancy grid built from a depth map.
 
 Projects depth pixels onto the ground (XZ) plane, accumulates a persistent
-hit/miss grid, extracts solid-surface contours with cv2.findContours, and
-renders a floor-plan style map with outlines around every solid object.
+hit/miss grid, extracts wall lines via Hough transform, and renders a clean
+floor-plan style map with straight lines for walls and surfaces.
 """
 
 import cv2
@@ -12,16 +12,15 @@ UNKNOWN = 0
 FREE = 1
 OCCUPIED = 2
 
-# Decay: slowly forget old observations so the map adapts if things move
-_DECAY_INTERVAL = 30        # frames between decay passes
-_DECAY_AMOUNT = 1            # subtract from counts each pass
+_DECAY_INTERVAL = 30
+_DECAY_AMOUNT = 1
 
 
 class OccupancyGrid2D:
     def __init__(self, size_m=10.0, resolution=0.05,
                  fx=320.0, fy=320.0, cx=None, cy=None,
                  min_height=-0.1, max_height=2.0,
-                 min_depth=0.15, max_depth=6.0, step=2):
+                 min_depth=0.15, max_depth=4.0, step=2):
         self.resolution = resolution
         self.size_m = size_m
         self.grid_size = int(size_m / resolution)
@@ -43,19 +42,13 @@ class OccupancyGrid2D:
         self._miss = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
         self._frame_count = 0
 
-        # Cached contour output (list of cv2 contours in grid coords)
-        self.contours = []
-        self.surface_rects = []  # list of (cx, cz_m, w_m, l_m, angle) in meters
+        # Extracted geometry
+        self.wall_lines = []      # list of ((x1,y1),(x2,y2)) in grid coords
+        self.surface_rects = []   # list of cv2.minAreaRect for bounded objects
 
     # ── public ──────────────────────────────────────────────────────────
 
     def update(self, depth_map, pose=None):
-        """Integrate one depth frame. Always accumulates (persistent map).
-
-        depth_map : uint16 ndarray (mm).
-        pose      : (x, y, theta) world pose, or None (robot stays at origin).
-        Returns the grid (uint8 2-D: 0=unknown, 1=free, 2=occupied).
-        """
         if depth_map is None or depth_map.size == 0:
             return self.grid
 
@@ -63,61 +56,43 @@ class OccupancyGrid2D:
 
         occ_rows, occ_cols = self._project(depth_map, pose)
         robot_r, robot_c = self._robot_cell(pose)
-
-        # Mark free cells via raycasting, occupied cells via hit counts
         self._raycast_free(robot_r, robot_c, occ_rows, occ_cols)
         self._rebuild_grid()
 
-        # Periodic decay so map forgets stale data
         if self._frame_count % _DECAY_INTERVAL == 0:
             mask = self._hit > 0
             self._hit[mask] = np.maximum(0, self._hit[mask] - _DECAY_AMOUNT)
             mask = self._miss > 0
             self._miss[mask] = np.maximum(0, self._miss[mask] - _DECAY_AMOUNT)
 
-        # Extract contours of all solid surfaces
-        self._extract_contours()
-
+        self._extract_geometry()
         return self.grid
 
     def clear(self):
         self.grid[:] = UNKNOWN
         self._hit[:] = 0
         self._miss[:] = 0
-        self.contours = []
+        self.wall_lines = []
         self.surface_rects = []
         self._frame_count = 0
 
     def render(self, tracked_objects=None, robot_pose=None):
-        """Render a BGR floor-plan image with solid-surface contour outlines."""
         gs = self.grid_size
-        img = np.full((gs, gs, 3), 30, dtype=np.uint8)     # dark background
-        img[self.grid == FREE] = [50, 50, 50]               # explored free = dark gray
-        img[self.grid == OCCUPIED] = [80, 80, 80]           # occupied fill = slightly lighter
+        img = np.full((gs, gs, 3), 25, dtype=np.uint8)
+        img[self.grid == FREE] = [45, 45, 45]
+        img[self.grid == OCCUPIED] = [70, 70, 70]
 
-        # Draw solid contour outlines (the main thing the user wants)
-        if self.contours:
-            cv2.drawContours(img, self.contours, -1, (0, 255, 0), 1)
-
-        # Draw fitted rectangles for large surfaces
-        for rect in self.surface_rects:
-            box = cv2.boxPoints(rect)
-            box = np.intp(box)
-            cv2.drawContours(img, [box], 0, (0, 220, 220), 1)
+        for (x1, y1), (x2, y2) in self.wall_lines:
+            cv2.line(img, (x1, y1), (x2, y2), (0, 220, 0), 2)
 
         # Robot marker
         rr, rc = self._robot_cell(robot_pose)
         cv2.circle(img, (rc, rr), 4, (0, 0, 255), -1)
-        # Heading arrow
-        if robot_pose is not None:
-            _, _, theta = robot_pose
-        else:
-            theta = 0.0
-        ar = int(rr - 8 * np.cos(theta))
-        ac = int(rc + 8 * np.sin(theta))
-        cv2.arrowedLine(img, (rc, rr), (ac, ar), (0, 0, 255), 2, tipLength=0.4)
+        theta = robot_pose[2] if robot_pose is not None else 0.0
+        ar = int(rr - 10 * np.cos(theta))
+        ac = int(rc + 10 * np.sin(theta))
+        cv2.arrowedLine(img, (rc, rr), (ac, ar), (0, 0, 255), 2, tipLength=0.35)
 
-        # YOLO-labeled tracked objects on top
         if tracked_objects:
             for obj in tracked_objects:
                 self._draw_tracked(img, obj)
@@ -125,11 +100,6 @@ class OccupancyGrid2D:
         return img
 
     def get_surface_list(self):
-        """Return a JSON-serialisable list of detected solid surfaces.
-
-        Each entry: {center_x, center_z, width, length, angle_deg, area_m2}
-        all in metres relative to robot origin.
-        """
         surfaces = []
         res = self.resolution
         for rect in self.surface_rects:
@@ -145,6 +115,22 @@ class OccupancyGrid2D:
                 'length': round(h_m, 3),
                 'angle_deg': round(angle, 1),
                 'area_m2': round(w_m * h_m, 4),
+            })
+        # Add wall lines as entries too
+        for (x1, y1), (x2, y2) in self.wall_lines:
+            cx_m = ((x1 + x2) / 2.0 - self.origin_col) * res
+            cz_m = (self.origin_row - (y1 + y2) / 2.0) * res
+            length_px = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            length_m = length_px * res
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            surfaces.append({
+                'center_x': round(cx_m, 3),
+                'center_z': round(cz_m, 3),
+                'width': round(length_m, 3),
+                'length': round(res, 3),
+                'angle_deg': round(angle, 1),
+                'area_m2': round(length_m * res, 4),
+                'type': 'wall',
             })
         return surfaces
 
@@ -195,17 +181,16 @@ class OccupancyGrid2D:
         px, py, _ = pose
         c = int(px / self.resolution + self.origin_col)
         r = int(self.origin_row - py / self.resolution)
-        return np.clip(r, 0, self.grid_size - 1), \
-               np.clip(c, 0, self.grid_size - 1)
+        return int(np.clip(r, 0, self.grid_size - 1)), \
+               int(np.clip(c, 0, self.grid_size - 1))
 
-    # ── raycasting (vectorised Bresenham) ───────────────────────────────
+    # ── raycasting ──────────────────────────────────────────────────────
 
     def _raycast_free(self, r0, c0, occ_rows, occ_cols):
         if len(occ_rows) == 0:
             return
         endpoints = np.column_stack((occ_rows, occ_cols))
         unique = np.unique(endpoints, axis=0)
-        # Subsample to keep fast — 6000 rays is plenty for a clean map
         if len(unique) > 6000:
             idx = np.random.choice(len(unique), 6000, replace=False)
             unique = unique[idx]
@@ -240,30 +225,38 @@ class OccupancyGrid2D:
         self.grid[free] = FREE
         self.grid[occ] = OCCUPIED
 
-    # ── contour extraction ──────────────────────────────────────────────
+    # ── geometry extraction (clean straight wall lines) ────────────────
 
-    def _extract_contours(self):
+    def _extract_geometry(self):
         occ_mask = (self.grid == OCCUPIED).astype(np.uint8) * 255
 
-        # Morphological close to connect nearby occupied cells into solid walls
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # Heavy morphological cleanup: close gaps then dilate to merge
+        # nearby occupied cells into solid wall bands
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, k_close, iterations=2)
+        k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.dilate(closed, k_dilate, iterations=1)
 
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        # Skeletonize to thin walls to single-pixel lines before Hough
+        skeleton = cv2.ximgproc.thinning(closed) \
+            if hasattr(cv2, 'ximgproc') else cv2.Canny(closed, 50, 150)
 
-        # Keep contours with meaningful area (> ~4 cells = 1cm^2 at 5cm res)
-        min_area = 4.0
-        self.contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+        raw_lines = cv2.HoughLinesP(
+            skeleton, rho=1, theta=np.pi / 180, threshold=20,
+            minLineLength=15, maxLineGap=10)
 
-        # Fit minimum-area rotated rectangles to large surfaces
-        min_rect_area = 20.0  # ~0.05 m^2
+        merged = []
+        if raw_lines is not None:
+            segments = [((l[0][0], l[0][1]), (l[0][2], l[0][3]))
+                        for l in raw_lines]
+            merged = _merge_collinear_segments(segments,
+                                               angle_thresh=12.0,
+                                               dist_thresh=8.0,
+                                               gap_thresh=20.0)
+        # Snap near-axis-aligned lines
+        self.wall_lines = [_snap_to_axis(p1, p2) for p1, p2 in merged
+                           if _seg_length(p1, p2) >= 8]
         self.surface_rects = []
-        for c in self.contours:
-            area = cv2.contourArea(c)
-            if area >= min_rect_area and len(c) >= 5:
-                rect = cv2.minAreaRect(c)
-                self.surface_rects.append(rect)
 
     # ── drawing ─────────────────────────────────────────────────────────
 
@@ -274,22 +267,125 @@ class OccupancyGrid2D:
         hl = max(2, int(obj['length'] / self.resolution / 2))
 
         color = _class_color(obj.get('class', ''))
-        r1, r2 = np.clip(cz - hl, 0, self.grid_size - 1), np.clip(cz + hl, 0, self.grid_size - 1)
-        c1, c2 = np.clip(cx - hw, 0, self.grid_size - 1), np.clip(cx + hw, 0, self.grid_size - 1)
+        gs = self.grid_size
+        r1 = int(np.clip(cz - hl, 0, gs - 1))
+        r2 = int(np.clip(cz + hl, 0, gs - 1))
+        c1 = int(np.clip(cx - hw, 0, gs - 1))
+        c2 = int(np.clip(cx + hw, 0, gs - 1))
         cv2.rectangle(img, (c1, r1), (c2, r2), color, 1)
 
         label = obj.get('class', '')
         tid = obj.get('track_id')
-        if tid is not None:
-            label = f"#{tid} {label}"
         name = obj.get('name')
         if name:
             label = f"#{tid} {name}"
+        elif tid is not None:
+            label = f"#{tid} {label}"
         dist = obj.get('distance')
         if dist is not None:
             label += f" {dist:.1f}m"
         cv2.putText(img, label, (c1, max(r1 - 3, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
+
+
+# ── Line merging helpers ────────────────────────────────────────────────────
+
+def _seg_angle(p1, p2):
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    return np.degrees(np.arctan2(dy, dx)) % 180
+
+def _seg_length(p1, p2):
+    return np.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
+
+def _point_to_line_dist(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-6:
+        return np.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+    return abs(dy * px - dx * py + x2 * y1 - y2 * x1) / np.sqrt(L2)
+
+def _snap_to_axis(p1, p2, snap_deg=8.0):
+    """If a line is within snap_deg of horizontal or vertical, make it exact."""
+    angle = _seg_angle(p1, p2)
+    # Near horizontal (0° or 180°)
+    if angle < snap_deg or angle > 180 - snap_deg:
+        mid_y = (p1[1] + p2[1]) // 2
+        return (p1[0], mid_y), (p2[0], mid_y)
+    # Near vertical (90°)
+    if abs(angle - 90) < snap_deg:
+        mid_x = (p1[0] + p2[0]) // 2
+        return (mid_x, p1[1]), (mid_x, p2[1])
+    return p1, p2
+
+
+def _merge_collinear_segments(segments, angle_thresh=10.0,
+                              dist_thresh=6.0, gap_thresh=12.0):
+    """Merge nearly-collinear line segments into longer straight walls."""
+    if not segments:
+        return []
+
+    used = [False] * len(segments)
+    merged = []
+
+    for i in range(len(segments)):
+        if used[i]:
+            continue
+        group = [segments[i]]
+        used[i] = True
+        a_i = _seg_angle(*segments[i])
+
+        for j in range(i + 1, len(segments)):
+            if used[j]:
+                continue
+            a_j = _seg_angle(*segments[j])
+            angle_diff = abs(a_i - a_j)
+            if angle_diff > 90:
+                angle_diff = 180 - angle_diff
+            if angle_diff > angle_thresh:
+                continue
+            # Check distance of j's midpoint to i's line
+            mx = (segments[j][0][0] + segments[j][1][0]) / 2
+            my = (segments[j][0][1] + segments[j][1][1]) / 2
+            d = _point_to_line_dist(mx, my, *segments[i][0], *segments[i][1])
+            if d > dist_thresh:
+                continue
+            # Check gap between segments isn't too big
+            pts_i = [segments[i][0], segments[i][1]]
+            pts_j = [segments[j][0], segments[j][1]]
+            min_gap = min(
+                _seg_length(pts_i[0], pts_j[0]),
+                _seg_length(pts_i[0], pts_j[1]),
+                _seg_length(pts_i[1], pts_j[0]),
+                _seg_length(pts_i[1], pts_j[1]),
+            )
+            total_len = _seg_length(*segments[i]) + _seg_length(*segments[j])
+            if min_gap > gap_thresh + total_len * 0.5:
+                continue
+            group.append(segments[j])
+            used[j] = True
+
+        # Merge group into one segment: fit a line to all endpoints
+        all_pts = []
+        for s in group:
+            all_pts.append(s[0])
+            all_pts.append(s[1])
+        pts = np.array(all_pts, dtype=np.float32)
+        if len(pts) >= 2:
+            # Project onto principal axis and take extremes
+            mean = pts.mean(axis=0)
+            centered = pts - mean
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            direction = vt[0]
+            projections = centered @ direction
+            i_min = np.argmin(projections)
+            i_max = np.argmax(projections)
+            p1 = (int(pts[i_min][0]), int(pts[i_min][1]))
+            p2 = (int(pts[i_max][0]), int(pts[i_max][1]))
+            if _seg_length(p1, p2) >= 5:
+                merged.append((p1, p2))
+
+    return merged
 
 
 def _class_color(cls):

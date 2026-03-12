@@ -1,14 +1,9 @@
 """Project depth and YOLO detections into 2D ground-plane objects.
 
-Two independent sources of objects:
-1. **Depth surfaces** — contours extracted from the occupancy grid give
-   bounding-box outlines of every solid surface (walls, furniture, pillars)
-   regardless of whether YOLO recognises them.
-2. **YOLO labels** — classified detections are projected onto the ground plane
-   so that recognised objects (chair, person, table…) get a class label.
-
-The two are merged: if a YOLO label overlaps a depth surface, the surface
-inherits the label.  Unlabelled surfaces are emitted as 'surface' or 'wall'.
+Two sources:
+1. Depth surfaces — bounded-object rects from the occupancy grid.
+2. YOLO labels — projected using TIGHT depth clustering so a couch doesn't
+   span the whole room (uses IQR to reject background/foreground outliers).
 """
 
 import numpy as np
@@ -16,9 +11,9 @@ import numpy as np
 
 class ObjectMap2D:
     def __init__(self, fx=320.0, fy=320.0, cx=None, cy=None,
-                 min_depth=0.15, max_depth=6.0,
+                 min_depth=0.15, max_depth=4.0,
                  min_height=-0.3, max_height=2.0,
-                 sample_grid=8):
+                 sample_grid=10):
         self.fx = fx
         self.fy = fy
         self._cx = cx
@@ -29,34 +24,19 @@ class ObjectMap2D:
         self.max_height = max_height
         self.sample_grid = sample_grid
 
-    # ── public ──────────────────────────────────────────────────────────
-
     def update(self, detections, depth_map, frame_shape=None,
                surface_rects=None, grid_resolution=0.05,
                grid_origin_col=100, grid_origin_row=199):
-        """Return ground-plane objects from depth surfaces + YOLO labels.
+        return self._project_yolo(detections, depth_map, frame_shape)
 
-        surface_rects : list of cv2.minAreaRect tuples from the occupancy grid.
-        """
-        yolo_objs = self._project_yolo(detections, depth_map, frame_shape)
-        surface_objs = self._surfaces_to_objects(
-            surface_rects, grid_resolution, grid_origin_col, grid_origin_row)
-
-        # Merge: if a YOLO box overlaps a surface, label the surface
-        merged = self._merge(yolo_objs, surface_objs)
-        return merged
-
-    # ── YOLO projection (kept from before) ──────────────────────────────
+    # ── YOLO projection with tight depth clustering ─────────────────────
 
     def _project_yolo(self, detections, depth_map, frame_shape):
         if depth_map is None or depth_map.size == 0 or not detections:
             return []
 
         dh, dw = depth_map.shape
-        if frame_shape is not None:
-            fh, fw = frame_shape
-        else:
-            fh, fw = dh * 2, dw * 2
+        fh, fw = frame_shape if frame_shape is not None else (dh * 2, dw * 2)
 
         cx = self._cx if self._cx is not None else dw / 2.0
         cy = self._cy if self._cy is not None else dh / 2.0
@@ -84,18 +64,35 @@ class ObjectMap2D:
 
             d = depth_map[vv, uu].astype(np.float32) / 1000.0
             valid = (d > self.min_depth) & (d < self.max_depth)
-            Y = (vv.astype(np.float32) - cy) * d / fy_d
-            valid &= (Y > self.min_height) & (Y < self.max_height)
-            if valid.sum() < 3:
+            if valid.sum() < 4:
                 continue
 
-            X = (uu[valid].astype(np.float32) - cx) * d[valid] / fx_d
-            Z = d[valid]
+            d_valid = d[valid]
+
+            # IQR filter: only keep depth values near the object's actual
+            # surface, rejecting background behind and floor in front.
+            q25 = np.percentile(d_valid, 25)
+            q75 = np.percentile(d_valid, 75)
+            iqr = q75 - q25
+            # Tight band: 1.0× IQR margin (not the usual 1.5×)
+            d_lo = q25 - max(iqr * 1.0, 0.15)
+            d_hi = q75 + max(iqr * 1.0, 0.15)
+            tight = valid.copy()
+            tight[valid] &= (d_valid >= d_lo) & (d_valid <= d_hi)
+            if tight.sum() < 3:
+                # Fall back to raw valid
+                tight = valid
+
+            X = (uu[tight].astype(np.float32) - cx) * d[tight] / fx_d
+            Z = d[tight]
 
             min_x, max_x = float(X.min()), float(X.max())
             min_z, max_z = float(Z.min()), float(Z.max())
             width = max(max_x - min_x, 0.05)
             length = max(max_z - min_z, 0.05)
+
+            width = min(width, 2.5)
+            length = min(length, 2.5)
 
             objects.append({
                 'class': det.get('class', 'object'),
@@ -110,7 +107,7 @@ class ObjectMap2D:
             })
         return objects
 
-    # ── depth-surface objects from occupancy grid contours ──────────────
+    # ── depth surfaces from occupancy grid ──────────────────────────────
 
     def _surfaces_to_objects(self, surface_rects, res, origin_col, origin_row):
         if not surface_rects:
@@ -125,7 +122,7 @@ class ObjectMap2D:
             if w_m < 0.08 and h_m < 0.08:
                 continue
             aspect = max(w_m, h_m) / max(min(w_m, h_m), 0.01)
-            cls = 'wall' if aspect > 4.0 else 'surface'
+            cls = 'wall' if aspect > 5.0 else 'surface'
             dist = max(abs(cz_m), 0.01)
             objects.append({
                 'class': cls,
@@ -140,7 +137,7 @@ class ObjectMap2D:
             })
         return objects
 
-    # ── merge YOLO labels onto depth surfaces ───────────────────────────
+    # ── merge ───────────────────────────────────────────────────────────
 
     def _merge(self, yolo_objs, surface_objs):
         used_surfaces = set()
@@ -172,10 +169,10 @@ class ObjectMap2D:
                 used_surfaces.add(best_idx)
                 merged.append({
                     'class': yo['class'],
-                    'center_x': so['center_x'],
-                    'center_z': so['center_z'],
-                    'width': so['width'],
-                    'length': so['length'],
+                    'center_x': yo['center_x'],
+                    'center_z': yo['center_z'],
+                    'width': yo['width'],
+                    'length': yo['length'],
                     'distance': yo['distance'],
                     'name': yo.get('name'),
                     'confidence': yo.get('confidence'),
@@ -192,5 +189,4 @@ class ObjectMap2D:
 
 
 def _overlap_1d(a1, a2, b1, b2):
-    """Overlap length of two 1-D intervals."""
     return max(0.0, min(a2, b2) - max(a1, b1))

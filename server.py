@@ -279,16 +279,6 @@ class SpatialMap2D:
         grid[slam_grid == 0] = FREE
         grid[slam_grid >= 50] = OCCUPIED
 
-        # Extract contours from the SLAM grid
-        occ_mask = (grid == OCCUPIED).astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        contours = [c for c in contours if cv2.contourArea(c) >= 4.0]
-        surface_rects = [cv2.minAreaRect(c) for c in contours
-                         if cv2.contourArea(c) >= 20.0 and len(c) >= 5]
-
         # Robot position from odom
         robot_col, robot_row = w // 2, h // 2
         if slam_odom is not None:
@@ -298,29 +288,26 @@ class SpatialMap2D:
             robot_col = max(0, min(w - 1, robot_col))
             robot_row = max(0, min(h - 1, robot_row))
 
-        # Project YOLO labels (using the local depth for depth-per-detection)
         map_objs = self.obj_map.update(
             detections, depth_map, frame_shape=frame_shape,
-            surface_rects=surface_rects,
-            grid_resolution=res,
-            grid_origin_col=robot_col,
-            grid_origin_row=robot_row,
         )
         tracked = self.tracker.update(map_objs)
 
-        # Render
+        # Render: occupancy grid background + wall contours + tracked YOLO objects
+        occ_mask = (grid == OCCUPIED).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c for c in contours if cv2.contourArea(c) >= 10.0]
+
         img = np.full((h, w, 3), 30, dtype=np.uint8)
         img[grid == FREE] = [50, 50, 50]
         img[grid == OCCUPIED] = [80, 80, 80]
         if contours:
-            cv2.drawContours(img, contours, -1, (0, 255, 0), 1)
-        for rect in surface_rects:
-            box = cv2.boxPoints(rect)
-            box = np.intp(box)
-            cv2.drawContours(img, [box], 0, (0, 220, 220), 1)
+            cv2.drawContours(img, contours, -1, (0, 200, 0), 1)
         cv2.circle(img, (robot_col, robot_row), 4, (0, 0, 255), -1)
 
-        # Draw tracked YOLO objects
         for obj in tracked:
             cx = int(obj['center_x'] / res + robot_col)
             cz = int(robot_row - obj['center_z'] / res)
@@ -339,19 +326,7 @@ class SpatialMap2D:
             cv2.putText(img, label, (c1, max(r1 - 3, 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
 
-        # Build surface list in metres
         surfaces = []
-        for rect in surface_rects:
-            (cc, cr), (w_px, h_px), angle = rect
-            cx_m = (cc - robot_col) * res
-            cz_m = (robot_row - cr) * res
-            w_m = w_px * res
-            h_m = h_px * res
-            surfaces.append({
-                'center_x': round(cx_m, 3), 'center_z': round(cz_m, 3),
-                'width': round(w_m, 3), 'length': round(h_m, 3),
-                'angle_deg': round(angle, 1), 'area_m2': round(w_m * h_m, 4),
-            })
 
         with self._lock:
             self._grid = grid.copy()
@@ -364,10 +339,6 @@ class SpatialMap2D:
         grid = self.occ_grid.update(depth_map, pose=pose)
         map_objs = self.obj_map.update(
             detections, depth_map, frame_shape=frame_shape,
-            surface_rects=self.occ_grid.surface_rects,
-            grid_resolution=self.occ_grid.resolution,
-            grid_origin_col=self.occ_grid.origin_col,
-            grid_origin_row=self.occ_grid.origin_row,
         )
         tracked = self.tracker.update(map_objs)
         surfaces = self.occ_grid.get_surface_list()
@@ -411,6 +382,7 @@ class SpatialMap2D:
                 'distance': round(t.get('distance', 0), 2),
                 'velocity_x': round(t.get('velocity_x', 0), 3),
                 'velocity_z': round(t.get('velocity_z', 0), 3),
+                'saved': t.get('saved', False),
             })
         grid_meta = None
         if grid is not None:
@@ -637,7 +609,8 @@ class FrameProcessor:
         depth_str = "Depth: ON" if depth_available else "Depth: waiting..."
         n_tracked = len(self.spatial_map._tracked)
         n_surfaces = len(self.spatial_map._surfaces)
-        status = f"FPS: {self._fps:.0f} | Det: {len(detections)} | Surfaces: {n_surfaces} | Tracked: {n_tracked} | {faces_str} | {depth_str}"
+        slam_str = "SLAM" if self.spatial_map._slam_active else "Local"
+        status = f"FPS: {self._fps:.0f} | {slam_str} | Det: {len(detections)} | Surf: {n_surfaces} | Track: {n_tracked} | {faces_str} | {depth_str}"
         cv2.putText(annotated, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
 
         with self._lock:
@@ -2108,18 +2081,24 @@ function drawOverlay() {
     const hw = Math.max(cellPx, (obj.width / res / 2) * cellPx);
     const hl = Math.max(cellPx, (obj.length / res / 2) * cellPx);
     const color = colorFor(obj['class']);
+    const isSaved = obj.saved && obj.velocity_x == 0 && obj.velocity_z == 0;
 
+    octx.globalAlpha = isSaved ? 0.55 : 1.0;
     octx.strokeStyle = color;
-    octx.lineWidth = 2;
+    octx.lineWidth = isSaved ? 1 : 2;
+    if (isSaved) { octx.setLineDash([4, 3]); } else { octx.setLineDash([]); }
     octx.strokeRect(cx - hw, cz - hl, hw * 2, hl * 2);
+    octx.setLineDash([]);
 
     let label = obj['class'];
     if (obj.name) label = obj.name;
     if (obj.track_id != null) label = '#' + obj.track_id + ' ' + label;
     if (obj.distance != null) label += ' ' + obj.distance.toFixed(1) + 'm';
+    if (isSaved) label += ' [saved]';
     octx.font = '10px system-ui';
     octx.fillStyle = color;
     octx.fillText(label, cx - hw, cz - hl - 3);
+    octx.globalAlpha = 1.0;
 
     if (obj.velocity_x != null && (Math.abs(obj.velocity_x) > 0.05 || Math.abs(obj.velocity_z) > 0.05)) {
       octx.beginPath();
@@ -2134,30 +2113,32 @@ function drawOverlay() {
 
 function renderInfo() {
   let html = '';
-  if (surfaces.length) {
-    html += '<div class="section-hdr">Solid Surfaces (from depth)</div>';
-    for (const s of surfaces) {
-      html += `<div class="surf-row">
-        <span>${s.width.toFixed(2)}m x ${s.length.toFixed(2)}m</span>
-        <span>at (${s.center_x.toFixed(2)}, ${s.center_z.toFixed(2)})</span>
-        <span>${s.angle_deg.toFixed(0)}&deg;</span>
-        <span>${s.area_m2.toFixed(2)}m&sup2;</span>
-      </div>`;
-    }
-  }
   if (objects.length) {
-    html += '<div class="section-hdr">Tracked Objects</div>';
-    for (const o of objects) {
-      html += `<div class="obj-row">
-        <span class="obj-class" style="color:${colorFor(o['class'])}">#${o.track_id} ${o.name||o['class']}</span>
-        <span class="obj-pos">pos(${o.center_x.toFixed(2)}, ${o.center_z.toFixed(2)})</span>
-        <span class="obj-size">${o.width.toFixed(2)}&times;${o.length.toFixed(2)}m</span>
-        <span>${o.distance.toFixed(1)}m</span>
-      </div>`;
+    const saved = objects.filter(o => o.saved);
+    const active = objects.filter(o => !o.saved);
+    if (active.length) {
+      html += '<div class="section-hdr">Active Objects</div>';
+      for (const o of active) {
+        html += `<div class="obj-row">
+          <span class="obj-class" style="color:${colorFor(o['class'])}">#${o.track_id} ${o.name||o['class']}</span>
+          <span class="obj-size">${o.width.toFixed(2)}&times;${o.length.toFixed(2)}m</span>
+          <span>${o.distance.toFixed(1)}m</span>
+        </div>`;
+      }
+    }
+    if (saved.length) {
+      html += '<div class="section-hdr">Saved Landmarks</div>';
+      for (const o of saved) {
+        html += `<div class="obj-row" style="opacity:0.7">
+          <span class="obj-class" style="color:${colorFor(o['class'])}">#${o.track_id} ${o.name||o['class']}</span>
+          <span class="obj-size">${o.width.toFixed(2)}&times;${o.length.toFixed(2)}m</span>
+          <span>${o.distance.toFixed(1)}m</span>
+        </div>`;
+      }
     }
   }
-  if (!surfaces.length && !objects.length) {
-    html = '<span style="color:#444">Waiting for depth data...</span>';
+  if (!objects.length) {
+    html = '<span style="color:#444">Waiting for detections...</span>';
   }
   infoDiv.innerHTML = html;
 }
@@ -2278,6 +2259,7 @@ class WebHandler(BaseHTTPRequestHandler):
         if self.path == '/map2d/reset':
             if fp:
                 fp.spatial_map.occ_grid.clear()
+                fp.spatial_map.tracker.clear()
             if robot:
                 robot.pose_x = robot.pose_y = robot.pose_theta = 0.0
                 robot._last_move_time = None
