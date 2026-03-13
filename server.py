@@ -41,6 +41,16 @@ from robot_controller import RobotController, CommandDispatcher
 from google import genai
 from google.genai import types
 
+# Optional ROS 2 bridge (publishes detections JSON for the autonomy stack)
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String as RosString
+except Exception:
+    rclpy = None
+    Node = None
+    RosString = None
+
 # Audio config
 SEND_SAMPLE_RATE = 16000
 RECV_SAMPLE_RATE = 24000
@@ -65,6 +75,10 @@ _frame_processor_ref = None
 _cmd_dispatcher_ref = None
 _session_ref = None
 _event_loop_ref = None
+
+_ros_node_ref = None
+_ros_detections_pub_ref = None
+_ros_last_pub_t = 0.0
 
 
 def add_transcript(role, text):
@@ -259,6 +273,8 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.start_tracking(target)
         elif action == 'stop':
             robot.stop_all()
+        elif action == 'explore':
+            robot.start_explore()
         elif action.startswith('go_to'):
             obj = target or action.replace('go_to_', '').replace('go_to', 'person')
             stop_dist = float(distance) if distance else 0.5
@@ -342,6 +358,11 @@ LOOKING / HEAD CONTROL:
 - "Looking left/right/up/down" — head movement
 - "Looking forward" or "Looking straight" — centers head
 
+AUTONOMOUS EXPLORATION:
+- "I'll explore" or "Exploring now" or "Wandering around" — walks around autonomously, avoiding obstacles
+- "I'll patrol" or "Roaming around" or "Walking around on my own" — same as explore
+- "Stopping now" — stops exploration
+
 MOVEMENT:
 - "Walking forward/backward" — walks briefly
 - "Strafing left/right" — sidesteps
@@ -358,6 +379,7 @@ DANCES & GESTURES:
 IMPORTANT RULES:
 - When someone says "follow me", respond with "I'll follow you!"
 - When someone says "go to the chair", respond with "Going to the chair!"
+- When someone says "explore", "walk around", "wander", or "look around", respond with "I'll explore!" or "Exploring now!"
 - Keep responses short and conversational.
 - Only trigger actions when explicitly asked or socially appropriate.
 """
@@ -444,6 +466,7 @@ async def gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref):
                         txt = sc.input_transcription.text
                         print(f"  You: {txt}")
                         add_transcript("You", txt)
+                        cmd_dispatcher.check_transcript(txt)
                     if sc.output_transcription and sc.output_transcription.text:
                         txt = sc.output_transcription.text
                         print(f"Robot: {txt}")
@@ -480,6 +503,18 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
                     frame_processor.on_depth_frame(payload)
                 elif msg_type == MSG_AUDIO_IN:
                     await audio_queue.put(payload)
+
+            # Publish detections to ROS2 (throttled) if enabled.
+            global _ros_last_pub_t
+            if _ros_detections_pub_ref is not None:
+                now = time.time()
+                if now - _ros_last_pub_t >= 0.2:  # ~5 Hz
+                    with frame_processor._lock:
+                        dets = list(frame_processor.latest_detections)
+                    m = RosString()
+                    m.data = json.dumps(dets)
+                    _ros_detections_pub_ref.publish(m)
+                    _ros_last_pub_t = now
     except Exception as e:
         print(f"[WS] Robot disconnected: {e}")
     finally:
@@ -493,6 +528,7 @@ async def handle_robot_ws(websocket, frame_processor: FrameProcessor,
 
 async def run_server(args):
     global _frame_processor_ref, _cmd_dispatcher_ref, _session_ref, _event_loop_ref
+    global _ros_node_ref, _ros_detections_pub_ref
 
     api_key = args.api_key or os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
     if not api_key:
@@ -550,6 +586,22 @@ async def run_server(args):
     )
     frame_processor._scene_graph = scene_graph
     _frame_processor_ref = frame_processor
+
+    # Best-effort ROS2 publisher for autonomy nodes (safe to ignore if ROS2 isn't installed here).
+    if rclpy is not None and Node is not None and RosString is not None:
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            _ros_node_ref = Node("k1_server_bridge")
+            _ros_detections_pub_ref = _ros_node_ref.create_publisher(
+                RosString, "/k1_vision/detections_json", 10
+            )
+            threading.Thread(target=rclpy.spin, args=(_ros_node_ref,), daemon=True).start()
+            print("[ROS2] Publishing detections on /k1_vision/detections_json")
+        except Exception as e:
+            print(f"[ROS2] Disabled: {e}")
+            _ros_node_ref = None
+            _ros_detections_pub_ref = None
 
     robot = RobotController()
     robot.set_frame_processor(frame_processor)

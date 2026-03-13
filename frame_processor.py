@@ -21,6 +21,7 @@ import re
 
 from stereo_depth import get_gradient_map_from_depth
 from scene_reconstructor import SceneReconstructor
+from ground_mapper import GroundMapper
 
 # Detection colors (BGR)
 _COLORS = [
@@ -128,7 +129,7 @@ class FrameProcessor:
     def __init__(self, model_path='yolov8m-seg.pt', confidence=0.5,
                  face_cache=None, enable_faces=True, on_transcript=None,
                  depth_estimator=None, sam2_segmenter=None,
-                 dust3r_reconstructor=None):
+                 dust3r_reconstructor=None, ground_mapper=None):
         print(f'Loading YOLO model: {model_path}')
         self.model = YOLO(model_path)
         self.confidence = confidence
@@ -139,6 +140,7 @@ class FrameProcessor:
         self.sam2_segmenter = sam2_segmenter
         self.dust3r_reconstructor = dust3r_reconstructor
         self._dust3r_frame_count = 0
+        self.ground_mapper = ground_mapper or GroundMapper()
 
         self._unknown_faces = {}
         self._next_unknown_id = 1
@@ -159,6 +161,13 @@ class FrameProcessor:
         self._fps_time = time.time()
 
         self.scene_reconstructor = SceneReconstructor()
+        # Share intrinsics between ground_mapper and scene_reconstructor
+        gm = self.ground_mapper
+        self.scene_reconstructor._fx = gm.K[0, 0]
+        self.scene_reconstructor._fy = gm.K[1, 1]
+        self.scene_reconstructor._cx = gm.K[0, 2]
+        self.scene_reconstructor._cy = gm.K[1, 2]
+        self.scene_reconstructor.cam_tilt_rad = gm.cam_tilt_rad
 
         self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self._pending_frame = None
@@ -267,6 +276,7 @@ class FrameProcessor:
             sam2_masks = self.sam2_segmenter.segment_from_boxes(rgb, yolo_boxes)
             sam2_str = f" | SAM2: {(time.time() - t0) * 1000:.0f}ms"
 
+        det_masks = [None] * len(detections)
         for i, det in enumerate(detections):
             cls_id = yolo_cls_ids[i]
             cls_name = det['class']
@@ -288,6 +298,7 @@ class FrameProcessor:
                 inst_id = len(instance_info)
                 seg_instance_map[mask_bool] = inst_id
                 instance_info.append({'cls_id': cls_id, 'cls_name': cls_name})
+                det_masks[i] = mask_bool
 
                 color_bgr = _color_for_class(cls_id)
                 annotated[mask_bool] = (
@@ -299,6 +310,36 @@ class FrameProcessor:
                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
                 )
                 cv2.drawContours(annotated, contours, -1, color_bgr, 1)
+
+        # Neural depth enhancement — run BEFORE ground mapping so mapper
+        # gets the clean fused depth instead of raw noisy stereo.
+        depth_for_scene = self._depth_map
+        neural_str = ""
+        if self.depth_estimator:
+            if self.depth_estimator.ready:
+                if depth_for_scene is not None:
+                    depth_for_scene = self.depth_estimator.refine_depth(frame, depth_for_scene)
+                else:
+                    depth_for_scene = self.depth_estimator.estimate_depth(frame)
+                self._depth_map_enhanced = depth_for_scene
+                neural_str = f" | Neural: {self.depth_estimator._inference_ms:.0f}ms"
+            else:
+                neural_str = " | Neural: loading..."
+
+        # Pick best available depth for ground mapping
+        best_depth = self._depth_map_enhanced if self._depth_map_enhanced is not None else self._depth_map
+
+        # Ground-plane floor localization for each detection
+        if self.ground_mapper and best_depth is not None:
+            self.ground_mapper.update(best_depth, (h, w))
+            for i, det in enumerate(detections):
+                floor_pos = self.ground_mapper.locate(
+                    det['bbox'], det_masks[i], label=det['class'],
+                )
+                det['floor_pos_m'] = floor_pos
+        else:
+            for det in detections:
+                det['floor_pos_m'] = None
 
         now = time.time()
         if self.enable_faces and has_persons and now - self._last_face_time >= self._face_interval:
@@ -333,30 +374,22 @@ class FrameProcessor:
                 label = f"{det['name']} {conf:.0%}"
             if distance_m is not None:
                 label += f" {distance_m:.1f}m"
+            floor = det.get('floor_pos_m')
+            if floor:
+                label += f" ({floor[0]:.1f},{floor[1]:.1f})"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
             cv2.putText(annotated, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+            # Debug: draw ground contact point
+            if floor:
+                cv2.circle(annotated, (int((x1+x2)/2), int(y2)), 4, (0, 255, 255), -1)
 
         self._fps_counter += 1
         if now - self._fps_time >= 1.0:
             self._fps = self._fps_counter / (now - self._fps_time)
             self._fps_counter = 0
             self._fps_time = now
-
-        # Neural depth enhancement
-        depth_for_scene = self._depth_map
-        neural_str = ""
-        if self.depth_estimator:
-            if self.depth_estimator.ready:
-                if depth_for_scene is not None:
-                    depth_for_scene = self.depth_estimator.refine_depth(frame, depth_for_scene)
-                else:
-                    depth_for_scene = self.depth_estimator.estimate_depth(frame)
-                self._depth_map_enhanced = depth_for_scene
-                neural_str = f" | Neural: {self.depth_estimator._inference_ms:.0f}ms"
-            else:
-                neural_str = " | Neural: loading..."
 
         # DUSt3R status (async, runs in background)
         dust3r_str = ""
@@ -538,5 +571,7 @@ class FrameProcessor:
         for d in dets:
             dist = f"{d['distance_m']:.1f}m away" if d['distance_m'] else "unknown dist"
             name_str = f" ({d['name']})" if d.get('name') else ""
-            lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist})")
+            floor = d.get('floor_pos_m')
+            floor_str = f", floor=({floor[0]:.2f},{floor[1]:.2f})m" if floor else ""
+            lines.append(f"- {d['class']}{name_str} ({d['confidence']:.0%}, {dist}{floor_str})")
         return "Detected objects:\n" + "\n".join(lines)

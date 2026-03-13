@@ -98,6 +98,9 @@ class SceneReconstructor:
         self._process_interval = 0.35
         self._fx = 400.0
         self._fy = 400.0
+        self._cx = 320.0
+        self._cy = 240.0
+        self.cam_tilt_rad = 0.0  # set from GroundMapper for consistency
 
         self._depth_buffer = []
         self._max_depth_frames = 3
@@ -453,8 +456,13 @@ class SceneReconstructor:
         """Unproject depth map to 3D splat points in Three.js coords."""
         dh, dw = depth_map.shape
         fh, fw = frame_shape if frame_shape else (dh, dw)
-        cx, cy = dw / 2.0, dh / 2.0
-        fx, fy = self._fx, self._fy
+        # Scale intrinsics from frame resolution to depth-map resolution
+        scale_x = dw / fw
+        scale_y = dh / fh
+        fx = self._fx * scale_x
+        fy = self._fy * scale_y
+        cx = self._cx * scale_x
+        cy = self._cy * scale_y
 
         step = max(1, min(dh, dw) // 80)
         vs = np.arange(0, dh, step)
@@ -473,9 +481,13 @@ class SceneReconstructor:
         cam_x = (uu_v - cx) * z_v / fx
         cam_y = (vv_v - cy) * z_v / fy
 
-        body_x = z_v
+        # Camera → body: apply tilt if set, otherwise simple axis swap
+        ct = math.cos(self.cam_tilt_rad)
+        st = math.sin(self.cam_tilt_rad)
+        # Axis swap: cam_Z→fwd, -cam_X→left, -cam_Y→up, then undo tilt
+        body_x = ct * z_v + st * (-cam_y)
         body_y = -cam_x
-        body_h = -cam_y
+        body_h = -st * z_v + ct * (-cam_y)
 
         c, s = math.cos(self.robot_theta), math.sin(self.robot_theta)
         world_x = self.robot_x + body_x * c - body_y * s
@@ -594,9 +606,9 @@ class SceneReconstructor:
             elif dist and dist > 0:
                 det_cx, det_cy = det['center']
                 fx, fy = self._fx, self._fy
-                cam_x_d = (det_cx - 320) * dist / fx
+                cam_x_d = (det_cx - self._cx) * dist / fx
                 bx, by = dist, -cam_x_d
-                bh = -(det_cy - 240) * dist / fy
+                bh = -(det_cy - self._cy) * dist / fy
                 cos_t = math.cos(self.robot_theta)
                 sin_t = math.sin(self.robot_theta)
                 wx = self.robot_x + bx * cos_t - by * sin_t
