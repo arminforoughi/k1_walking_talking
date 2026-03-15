@@ -118,6 +118,9 @@ _CMD_PATTERNS = [
     (re.compile(r"\b(?:karate|kung\s*fu)\b", re.IGNORECASE), "dance_karate"),
     (re.compile(r"\b(?:nod(?:ding)?)\b", re.IGNORECASE), "nod"),
     (re.compile(r"\b(?:shak(?:e|ing)\s+(?:my\s+)?head)\b", re.IGNORECASE), "head_shake"),
+    (re.compile(r"\b(?:get\s+up|stand\s+up|get\s+back\s+up)\b", re.IGNORECASE), "get_up"),
+    (re.compile(r"\b(?:shoot|kick\s+the\s+ball|power\s+kick)\b", re.IGNORECASE), "shoot"),
+    (re.compile(r"\b(?:side\s*foot\s*kick|visual\s*kick|pass\s+the\s+ball)\b", re.IGNORECASE), "visual_kick"),
 ]
 
 
@@ -641,6 +644,15 @@ class RobotController:
 
     def do_flex(self):
         self._send({'cmd': 'flex'})
+
+    def do_get_up(self):
+        self._send({'cmd': 'get_up'})
+
+    def do_shoot(self):
+        self._send({'cmd': 'shoot'})
+
+    def do_visual_kick(self, start=True):
+        self._send({'cmd': 'visual_kick', 'start': start})
 
     # ── Tracking ─────────────────────────────────────────────────────────
 
@@ -1182,6 +1194,9 @@ class CommandDispatcher:
             "back_up": self.robot.back_up,
             "nod": self.robot.nod,
             "head_shake": self.robot.head_shake,
+            "get_up": self.robot.do_get_up,
+            "shoot": self.robot.do_shoot,
+            "visual_kick": lambda: self.robot.do_visual_kick(True),
         }
 
         if cmd in actions:
@@ -1196,6 +1211,7 @@ transcript = deque(maxlen=200)
 transcript_lock = threading.Lock()
 _frame_processor_ref = None
 _cmd_dispatcher_ref = None
+_slam_ref = {}  # 'slam' -> K1SLAM instance (lazy-created)
 _session_ref = None
 _event_loop_ref = None
 
@@ -1240,8 +1256,14 @@ HTML_PAGE = """<!DOCTYPE html>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; height:100vh; }
-  #left { flex:1; display:flex; align-items:center; justify-content:center; background:#000; min-width:0; }
-  #left img { max-width:100%; max-height:100%; object-fit:contain; }
+  #left { flex:1; display:flex; flex-direction:column; background:#000; min-width:0; }
+  #camera-wrap { flex:1; display:flex; align-items:center; justify-content:center; min-height:0; }
+  #camera-wrap img { max-width:100%; max-height:100%; object-fit:contain; }
+  #left-slam { flex-shrink:0; padding:8px; border-top:1px solid #333; background:#0a0a0a; }
+  #left-slam h3 { font-size:11px; color:#888; margin-bottom:4px; text-transform:uppercase; letter-spacing:1px; }
+  #left-slam .slam-status { font-size:11px; color:#666; margin-bottom:4px; }
+  #left-slam img { width:100%; max-height:140px; object-fit:contain; background:#1a1a1a; border-radius:4px; display:block; }
+  #left-slam .btn-row { margin-top:6px; gap:6px; }
   #right { width:420px; display:flex; flex-direction:column; border-left:1px solid #333; }
   #header { padding:12px 16px; border-bottom:1px solid #333; font-size:14px; color:#888; }
   #header span { color:#4CAF50; font-weight:bold; }
@@ -1257,6 +1279,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .btn-head { background:#43e97b; color:#000; }
   .btn-stop { background:#f44336; color:#fff; }
   .btn-mode { background:#FF9800; color:#000; }
+  .btn-soccer { background:linear-gradient(135deg,#2e7d32,#1b5e20); color:#fff; }
   #robot-status { padding:6px 16px; border-bottom:1px solid #333; font-size:12px; }
   .connected { color:#4CAF50; } .disconnected { color:#f44336; }
   #detections { padding:8px 16px; border-bottom:1px solid #333; max-height:150px; overflow-y:auto; }
@@ -1286,10 +1309,25 @@ HTML_PAGE = """<!DOCTYPE html>
   #send-btn:hover { background:#66BB6A; }
   #status { padding:8px 16px; border-top:1px solid #333; font-size:12px; color:#666; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#4CAF50; margin-right:6px; }
+  .slam-status { font-size:12px; color:#888; margin-bottom:4px; }
 </style>
 </head>
 <body>
-  <div id="left"><img id="feed" src="/frame" alt="Camera"></div>
+  <div id="left">
+    <div id="camera-wrap"><img id="feed" src="/frame" alt="Camera"></div>
+    <div id="left-slam">
+      <h3>SLAM Map</h3>
+      <div id="slam-status" class="slam-status">Checking...</div>
+      <div id="slam-map-wrap" style="display:none;">
+        <img id="slam-map-img" src="" alt="SLAM map">
+        <div class="btn-row" style="display:flex; flex-wrap:wrap;">
+          <button class="ctrl-btn btn-action" style="font-size:11px; padding:4px 8px;" onclick="refreshSlamMap()">Refresh</button>
+          <a href="/slam/map" target="_blank" class="ctrl-btn btn-action" style="font-size:11px; padding:4px 8px; text-decoration:none; color:#fff;">Open full</a>
+          <button class="ctrl-btn btn-stop" style="font-size:11px; padding:4px 8px;" onclick="resetSlam()">Reset map</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <div id="right">
     <div id="header"><span>Gemini Robot Control</span> &mdash; Remote Mode</div>
     <div id="robot-status"><span id="conn-dot" class="disconnected">&#9679;</span> <span id="conn-text">Robot: connecting...</span></div>
@@ -1332,6 +1370,11 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-action" onclick="cmd('flex')">Flex</button>
         <button class="ctrl-btn btn-action" onclick="cmd('nod')">Nod</button>
         <button class="ctrl-btn btn-action" onclick="cmd('head_shake')">Shake Head</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('get_up')">Get Up</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-soccer" onclick="cmd('shoot')">Shoot</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('visual_kick')">Side Foot Kick</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-head" onclick="cmd('look_up')">Look Up</button>
@@ -1357,7 +1400,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">Open 3D View</a></div>
+    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">3D View</a> | <a href="/slam/map" target="_blank" style="color:#4CAF50;">SLAM Map</a></div>
   </div>
 <script>
   const img = document.getElementById('feed');
@@ -1423,6 +1466,40 @@ HTML_PAGE = """<!DOCTYPE html>
     setTimeout(pollTranscript, 500);
   }
   pollTranscript();
+
+  async function refreshSlamMap() {
+    const img = document.getElementById('slam-map-img');
+    const wrap = document.getElementById('slam-map-wrap');
+    if (wrap.style.display !== 'none') img.src = '/slam/map?t=' + Date.now();
+  }
+  async function resetSlam() {
+    try {
+      await fetch('/slam/reset', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+      refreshSlamMap();
+    } catch (e) { console.error(e); }
+  }
+  const slamStatusEl = document.getElementById('slam-status');
+  const slamMapWrap = document.getElementById('slam-map-wrap');
+  const slamMapImg = document.getElementById('slam-map-img');
+  async function pollSlamStatus() {
+    try {
+      const r = await fetch('/slam/status');
+      const d = await r.json();
+      if (d.active) {
+        slamStatusEl.textContent = 'Active (frames: ' + (d.frame_count || 0) + ')';
+        slamMapWrap.style.display = 'block';
+        slamMapImg.src = '/slam/map?t=' + Date.now();
+      } else {
+        slamStatusEl.textContent = 'Inactive (connect robot with depth for SLAM)';
+        slamMapWrap.style.display = 'none';
+      }
+    } catch (e) {
+      slamStatusEl.textContent = 'SLAM unavailable';
+      slamMapWrap.style.display = 'none';
+    }
+    setTimeout(pollSlamStatus, 3000);
+  }
+  pollSlamStatus();
 
   const detList = document.getElementById('det-list');
   async function pollDetections() {
@@ -1679,6 +1756,7 @@ window.addEventListener('resize', () => {
 
 
 class WebHandler(BaseHTTPRequestHandler):
+    slam_ref = None  # set by start_web_server
     frame_processor = None
     robot_controller = None
 
@@ -1753,6 +1831,77 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(HTML_3D_PAGE.encode())
+        elif self.path.startswith('/slam/pose'):
+            slam = (self.slam_ref or {}).get('slam')
+            if not slam:
+                self._json_response({
+                    'error': 'SLAM not running',
+                    'hint': 'Install Open3D (pip install open3d) and ensure the robot is connected with depth streaming. Start server without --no-slam.',
+                    'pose': None,
+                }, 503)
+                return
+            pose = slam.get_pose().tolist()
+            x, y, yaw = slam.get_odometry_xy_theta()
+            self._json_response({
+                'pose': pose,
+                'x': x, 'y': y, 'yaw_rad': yaw,
+                'frame_count': getattr(slam, '_frame_count', 0),
+            })
+        elif self.path.startswith('/slam/status'):
+            slam = (self.slam_ref or {}).get('slam')
+            self._json_response({
+                'active': slam is not None,
+                'frame_count': getattr(slam, '_frame_count', 0) if slam else 0,
+            })
+        elif self.path.startswith('/slam/map'):
+            slam = (self.slam_ref or {}).get('slam')
+            if not slam:
+                self.send_response(503)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                msg = (
+                    '<!DOCTYPE html><html><body style="font-family:sans-serif; padding:2rem; background:#111; color:#eee;">'
+                    '<h1>SLAM not running</h1><p>To enable SLAM:</p><ul>'
+                    '<li>Install Open3D: <code>pip install open3d</code></li>'
+                    '<li>Start the server without <code>--no-slam</code></li>'
+                    '<li>Connect the robot so it streams depth (e.g. from /StereoNetNode/stereonet_depth)</li>'
+                    '</ul><p>Then the map will appear here and in the main UI.</p></body></html>'
+                )
+                self.wfile.write(msg.encode('utf-8'))
+                return
+            result = slam.get_occupancy_grid(resolution=0.05, width_m=10.0, height_m=10.0)
+            if result is None:
+                self.send_error(503, 'No map yet')
+                return
+            grid, res, (ox, oy) = result
+            # Return as PNG image (0=free, 100=occupied, colormap for viz)
+            import io
+            grid_vis = np.uint8(255 - grid)  # invert so occupied is dark
+            _, buf = cv2.imencode('.png', grid_vis)
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(buf.tobytes())
+        elif self.path.startswith('/slam/mesh'):
+            slam = (self.slam_ref or {}).get('slam')
+            if not slam:
+                self.send_response(503)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(
+                    b'SLAM not running. Install open3d (pip install open3d), start without --no-slam, and connect the robot with depth.'
+                )
+                return
+            ply = slam.get_mesh_ply()
+            if ply is None:
+                self.send_error(503, 'No mesh yet')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition', 'attachment; filename=k1_slam_map.ply')
+            self.end_headers()
+            self.wfile.write(ply)
         else:
             self.send_error(404)
 
@@ -1798,6 +1947,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             fp.face_cache.delete_face(name)
             self._json_response({'ok': True})
+        elif self.path == '/slam/reset':
+            slam = (self.slam_ref or {}).get('slam')
+            if slam:
+                slam.reset()
+            self._json_response({'ok': True})
         else:
             self.send_error(404)
 
@@ -1831,6 +1985,12 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.do_dab()
         elif action == 'flex':
             robot.do_flex()
+        elif action == 'get_up':
+            robot.do_get_up()
+        elif action == 'shoot':
+            robot.do_shoot()
+        elif action == 'visual_kick':
+            robot.do_visual_kick(start=body.get('start', True) if isinstance(body, dict) else True)
         elif action == 'nod':
             robot.nod()
         elif action == 'head_shake':
@@ -1864,9 +2024,10 @@ class WebHandler(BaseHTTPRequestHandler):
         return {'status': 'ok', 'action': action}
 
 
-def start_web_server(frame_processor, robot_controller, host, port):
+def start_web_server(frame_processor, robot_controller, host, port, slam_ref=None):
     WebHandler.frame_processor = frame_processor
     WebHandler.robot_controller = robot_controller
+    WebHandler.slam_ref = slam_ref or {}
     httpd = HTTPServer((host, port), WebHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -1974,6 +2135,34 @@ async def gemini_send_local_audio(session, pya, mic_device=None, mic_gain=1.0):
         stream.close()
 
 
+async def _slam_update_loop(frame_processor, slam_ref, interval=0.35):
+    """Background task: run SLAM updates from latest depth + RGB (throttled)."""
+    slam = slam_ref.get('slam')
+    if not slam:
+        return
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            fp = frame_processor
+            if not fp or fp._depth_map is None or fp._raw_frame is None:
+                continue
+            depth = fp._depth_map.copy()
+            rgb = fp._raw_frame.copy()
+            slam = slam_ref.get('slam')
+            if not slam:
+                continue
+            dh, dw = depth.shape
+            cx, cy = dw / 2.0, dh / 2.0
+            def _run():
+                slam.update(depth, rgb=rgb, cx=cx, cy=cy, min_interval=interval)
+            await loop.run_in_executor(None, _run)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 async def gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref):
     """Receive Gemini responses: play audio locally + send to robot, parse commands."""
     stream = pya.open(
@@ -2076,7 +2265,18 @@ async def run_server(args):
     cmd_dispatcher = CommandDispatcher(robot)
     _cmd_dispatcher_ref = cmd_dispatcher
 
-    httpd = start_web_server(frame_processor, robot, '0.0.0.0', args.port)
+    # Eager-init SLAM so /slam/status and /slam/pose work immediately; map fills when robot sends depth
+    if not getattr(args, 'no_slam', False):
+        try:
+            from slam.k1_slam import K1SLAM
+            _slam_ref['slam'] = K1SLAM(enable_tsdf=True)
+            print("SLAM: enabled (map will appear when robot streams depth)")
+        except ImportError as e:
+            print("SLAM: disabled (install with: pip install open3d)")
+        except Exception as e:
+            print(f"SLAM: disabled ({e})")
+
+    httpd = start_web_server(frame_processor, robot, '0.0.0.0', args.port, slam_ref=_slam_ref)
     print(f"Web UI: http://0.0.0.0:{args.port}")
 
     audio_queue = asyncio.Queue(maxsize=100)
@@ -2131,6 +2331,8 @@ async def run_server(args):
                 asyncio.create_task(gemini_send_video(session, frame_processor, args.frame_interval)),
                 asyncio.create_task(gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref)),
             ]
+            if not getattr(args, 'no_slam', False):
+                tasks.append(asyncio.create_task(_slam_update_loop(frame_processor, _slam_ref)))
 
             if args.audio_source == 'local':
                 tasks.append(asyncio.create_task(
@@ -2180,6 +2382,8 @@ def main():
                         help='Mic gain (only for --audio-source local)')
     parser.add_argument('--mic-device', type=int, default=None,
                         help='PyAudio mic device (only for --audio-source local)')
+    parser.add_argument('--no-slam', action='store_true',
+                        help='Disable SLAM (localization + map from depth stream)')
     args = parser.parse_args()
 
     print("=" * 60)

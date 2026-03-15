@@ -216,6 +216,39 @@ class RobotExecutor:
     def _cmd_flex(self, _):
         threading.Thread(target=self._flex, daemon=True).start()
 
+    def _cmd_get_up(self, _):
+        def _do():
+            with self.lock:
+                self.client.GetUp()
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _cmd_shoot(self, _):
+        """Powerful kicking motion (soccer shoot)."""
+        def _do():
+            try:
+                from booster_robotics_sdk_python import B1LocoApiId
+                with self.lock:
+                    self.client.SendApiRequest(B1LocoApiId(2024), "")
+            except (ImportError, AttributeError):
+                with self.lock:
+                    self.client.SendApiRequest(2024, "")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _cmd_visual_kick(self, m):
+        """Side-foot kick. start=True to kick, start=False to stop."""
+        start = m.get('start', True)
+        def _do():
+            try:
+                from booster_robotics_sdk_python import B1LocoApiId
+                param = json.dumps({'start': start})
+                with self.lock:
+                    self.client.SendApiRequest(B1LocoApiId(2038), param)
+            except (ImportError, AttributeError):
+                param = json.dumps({'start': start})
+                with self.lock:
+                    self.client.SendApiRequest(2038, param)
+        threading.Thread(target=_do, daemon=True).start()
+
     # ── Arm commands (for server-driven choreography if needed)
 
     def _cmd_arm_to_side(self, m):
