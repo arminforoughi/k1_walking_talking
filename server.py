@@ -128,6 +128,47 @@ def _color_for_class(cls_id):
     return _COLORS[cls_id % len(_COLORS)]
 
 
+def _project_detections_to_map(detections, world_T_cam, origin_xy, resolution, grid_rows, grid_cols, frame_shape, fx=320.0, fy=320.0):
+    """
+    Project YOLO detections (image bbox center + depth) to 2D map pixel coords.
+    world_T_cam: 4x4 camera pose. origin_xy: (ox, oy) in meters. resolution: m per pixel.
+    Returns list of (col, row, label, color_bgr) for drawing on the map image.
+    """
+    if not detections or world_T_cam is None:
+        return []
+    fh, fw = frame_shape[:2] if frame_shape is not None else (480, 640)
+    cx0, cy0 = fw / 2.0, fh / 2.0
+    ox, oy = origin_xy
+    out = []
+    for i, det in enumerate(detections):
+        distance_m = det.get('distance_m')
+        if distance_m is None or distance_m <= 0.05 or distance_m > 15.0:
+            continue
+        cx, cy = det.get('center', (fw // 2, fh // 2))
+        if isinstance(cx, (list, tuple)):
+            cx, cy = cx[0], cx[1]
+        z = float(distance_m)
+        x_cam = (cx - cx0) * z / fx
+        y_cam = (cy - cy0) * z / fy
+        p_cam = np.array([x_cam, y_cam, z, 1.0], dtype=np.float64)
+        p_world = world_T_cam @ p_cam
+        wx, wy = float(p_world[0]), float(p_world[1])
+        col = int((wx - ox) / resolution)
+        row = int((wy - oy) / resolution)
+        if col < 0 or col >= grid_cols or row < 0 or row >= grid_rows:
+            continue
+        cls_name = det.get('class', '?')
+        name = det.get('name')
+        if name and cls_name == 'person':
+            label = name
+        else:
+            label = cls_name
+        cls_id = hash(cls_name) % len(_COLORS)
+        color = _color_for_class(cls_id)
+        out.append((col, row, label, color))
+    return out
+
+
 # ── Face Cache ───────────────────────────────────────────────────────────────
 
 FACE_CACHE_DIR = os.path.expanduser('~/.face_cache')
@@ -1255,16 +1296,17 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>Gemini Robot Control (Remote)</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; height:100vh; }
-  #left { flex:1; display:flex; flex-direction:column; background:#000; min-width:0; }
-  #camera-wrap { flex:1; display:flex; align-items:center; justify-content:center; min-height:0; }
-  #camera-wrap img { max-width:100%; max-height:100%; object-fit:contain; }
+  html, body { height:100%; overflow:hidden; }
+  body { background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; height:100vh; min-height:0; }
+  #left { flex:1; display:flex; flex-direction:column; background:#000; min-width:0; min-height:0; }
+  #camera-wrap { flex:1; display:flex; align-items:center; justify-content:center; min-height:0; overflow:hidden; }
+  #camera-wrap img { width:100%; height:100%; object-fit:contain; display:block; }
   #left-slam { flex-shrink:0; padding:8px; border-top:1px solid #333; background:#0a0a0a; }
   #left-slam h3 { font-size:11px; color:#888; margin-bottom:4px; text-transform:uppercase; letter-spacing:1px; }
   #left-slam .slam-status { font-size:11px; color:#666; margin-bottom:4px; }
-  #left-slam img { width:100%; max-height:140px; object-fit:contain; background:#1a1a1a; border-radius:4px; display:block; }
+  #left-slam img { width:100%; max-height:260px; object-fit:contain; background:#1a1a1a; border-radius:4px; display:block; }
   #left-slam .btn-row { margin-top:6px; gap:6px; }
-  #right { width:420px; display:flex; flex-direction:column; border-left:1px solid #333; }
+  #right { width:380px; flex-shrink:0; display:flex; flex-direction:column; border-left:1px solid #333; min-height:0; }
   #header { padding:12px 16px; border-bottom:1px solid #333; font-size:14px; color:#888; }
   #header span { color:#4CAF50; font-weight:bold; }
   #controls { padding:8px 16px; border-bottom:1px solid #333; }
@@ -1338,6 +1380,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-follow" onclick="cmd('track')">Track Person</button>
         <button class="ctrl-btn btn-follow" onclick="goToPrompt()">Go To...</button>
         <button class="ctrl-btn btn-stop" onclick="cmd('stop')">STOP ALL</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('get_up')">Get Up</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-dance" onclick="cmd('dance')">Dance</button>
@@ -1370,7 +1413,6 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-action" onclick="cmd('flex')">Flex</button>
         <button class="ctrl-btn btn-action" onclick="cmd('nod')">Nod</button>
         <button class="ctrl-btn btn-action" onclick="cmd('head_shake')">Shake Head</button>
-        <button class="ctrl-btn btn-action" onclick="cmd('get_up')">Get Up</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-soccer" onclick="cmd('shoot')">Shoot</button>
@@ -1869,14 +1911,48 @@ class WebHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(msg.encode('utf-8'))
                 return
-            result = slam.get_occupancy_grid(resolution=0.05, width_m=10.0, height_m=10.0)
+            # Center map on robot so robot is in the middle, surroundings around it
+            result = slam.get_occupancy_grid(
+                resolution=0.05, width_m=10.0, height_m=10.0, center_on_robot=True
+            )
             if result is None:
                 self.send_error(503, 'No map yet')
                 return
             grid, res, (ox, oy) = result
-            # Return as PNG image (0=free, 100=occupied, colormap for viz)
-            import io
+            # Return as PNG image (0=free, 100=occupied); draw robot at center
             grid_vis = np.uint8(255 - grid)  # invert so occupied is dark
+            grid_vis = cv2.cvtColor(grid_vis, cv2.COLOR_GRAY2BGR)
+            h, w = grid_vis.shape[:2]
+            cx, cy = w // 2, h // 2
+            # Robot as green triangle; rotate by yaw so it points in heading direction
+            _, _, yaw = slam.get_odometry_xy_theta()
+            cos_a, sin_a = math.cos(-yaw), math.sin(-yaw)
+            tip = np.array([0, -10])
+            left = np.array([-6, 6])
+            right = np.array([6, 6])
+            def rot(p):
+                return (cx + p[0] * cos_a - p[1] * sin_a, cy + p[0] * sin_a + p[1] * cos_a)
+            pts = np.array([[rot(tip), rot(left), rot(right)]], dtype=np.int32)
+            cv2.fillPoly(grid_vis, pts, (0, 255, 0))
+            cv2.circle(grid_vis, (cx, cy), 3, (0, 255, 0), -1)
+            # Semantic overlay: project YOLO detections onto map using depth + pose
+            fp = self.frame_processor
+            if fp is not None:
+                with fp._lock:
+                    dets = list(fp.latest_detections)
+                    raw = fp._raw_frame
+                if raw is not None and dets:
+                    pose = slam.get_pose()
+                    frame_shape = raw.shape
+                    projected = _project_detections_to_map(
+                        dets, pose, (ox, oy), res, h, w, frame_shape
+                    )
+                    for col, row, label, color in projected:
+                        cv2.circle(grid_vis, (col, row), 5, color, 2)
+                        cv2.putText(
+                            grid_vis, label, (col + 6, row),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA
+                        )
             _, buf = cv2.imencode('.png', grid_vis)
             self.send_response(200)
             self.send_header('Content-Type', 'image/png')

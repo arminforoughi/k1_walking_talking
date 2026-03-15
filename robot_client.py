@@ -171,17 +171,18 @@ class RobotExecutor:
             self.client.RotateHead(p, y)
 
     # ── Gesture commands
+    # Wave/Handshake run without the main lock so switching gestures (e.g. wave -> handshake)
+    # can interrupt: the new command is sent immediately and the robot switches to it.
+    # The main lock would block for the full gesture duration and cause "stuck" behavior.
 
     def _cmd_wave(self, _):
         def _do():
-            with self.lock:
-                self.client.WaveHand(B1HandAction.kHandOpen)
+            self.client.WaveHand(B1HandAction.kHandOpen)
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_handshake(self, _):
         def _do():
-            with self.lock:
-                self.client.Handshake(B1HandAction.kHandOpen)
+            self.client.Handshake(B1HandAction.kHandOpen)
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_nod(self, _):
