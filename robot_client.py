@@ -143,6 +143,7 @@ class RobotExecutor:
         self.head_yaw = 0.0
         self.right_arm_pos = [0.35, -0.25, 0.1]
         self.left_arm_pos = [0.35, 0.25, 0.1]
+        self._gesture_cancel = threading.Event()
 
     def handle(self, msg):
         cmd = msg.get('cmd')
@@ -171,37 +172,48 @@ class RobotExecutor:
             self.client.RotateHead(p, y)
 
     # ── Gesture commands
-    # Wave/Handshake run without the main lock so switching gestures (e.g. wave -> handshake)
-    # can interrupt: the new command is sent immediately and the robot switches to it.
-    # The main lock would block for the full gesture duration and cause "stuck" behavior.
+
+    def _cmd_stop_gesture(self, _):
+        """Stop any ongoing gesture and reset arms/head to neutral."""
+        self._cancel_gesture_and_reset()
 
     def _cmd_wave(self, _):
         def _do():
-            self.client.WaveHand(B1HandAction.kHandOpen)
+            self._cancel_gesture_and_reset()
+            with self.lock:
+                self.client.WaveHand(B1HandAction.kHandOpen)
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_handshake(self, _):
         def _do():
-            self.client.Handshake(B1HandAction.kHandOpen)
+            self._cancel_gesture_and_reset()
+            with self.lock:
+                self.client.Handshake(B1HandAction.kHandOpen)
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_nod(self, _):
         def _do():
+            self._cancel_gesture_and_reset()
             for _ in range(3):
+                if self._gesture_cancel.is_set():
+                    return
                 self._set_head(0.3, self.head_yaw)
-                time.sleep(0.25)
+                self._sleep_cancelable(0.25)
                 self._set_head(-0.1, self.head_yaw)
-                time.sleep(0.25)
+                self._sleep_cancelable(0.25)
             self._set_head(0.0, 0.0)
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_head_shake(self, _):
         def _do():
+            self._cancel_gesture_and_reset()
             for _ in range(3):
+                if self._gesture_cancel.is_set():
+                    return
                 self._set_head(self.head_pitch, 0.4)
-                time.sleep(0.2)
+                self._sleep_cancelable(0.2)
                 self._set_head(self.head_pitch, -0.4)
-                time.sleep(0.2)
+                self._sleep_cancelable(0.2)
             self._set_head(0.0, 0.0)
         threading.Thread(target=_do, daemon=True).start()
 
@@ -212,10 +224,16 @@ class RobotExecutor:
         threading.Thread(target=self._run_dance, args=(name,), daemon=True).start()
 
     def _cmd_dab(self, _):
-        threading.Thread(target=self._dab, daemon=True).start()
+        def _do():
+            self._cancel_gesture_and_reset()
+            self._dab()
+        threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_flex(self, _):
-        threading.Thread(target=self._flex, daemon=True).start()
+        def _do():
+            self._cancel_gesture_and_reset()
+            self._flex()
+        threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_get_up(self, _):
         def _do():
@@ -277,6 +295,23 @@ class RobotExecutor:
         with self.lock:
             self.client.RotateHead(pitch, yaw)
 
+    def _sleep_cancelable(self, duration):
+        """Sleep for duration, return early if gesture cancelled."""
+        start = time.time()
+        while time.time() - start < duration:
+            if self._gesture_cancel.is_set():
+                return
+            time.sleep(0.05)
+
+    def _cancel_gesture_and_reset(self):
+        """Stop any running gesture and reset arms/head to neutral."""
+        self._gesture_cancel.set()
+        time.sleep(0.08)  # let previous gesture thread notice and exit
+        self._gesture_cancel.clear()
+        self._arm_to_side('right')
+        self._arm_to_side('left')
+        self._set_head(0.0, 0.0)
+
     def _arm_to_side(self, hand):
         is_left = hand == 'left'
         y_sign = 1 if is_left else -1
@@ -320,6 +355,7 @@ class RobotExecutor:
     # ── Dance routines (run locally for timing precision) ───────────────────
 
     def _run_dance(self, name):
+        self._cancel_gesture_and_reset()
         try:
             from booster_robotics_sdk_python import B1LocoApiId
 
@@ -366,113 +402,145 @@ class RobotExecutor:
     def _dance_default(self):
         D = 0.2
         for _ in range(2):
+            if self._gesture_cancel.is_set(): return
             self._set_head(0.0, -0.5)
             self._arm_to_side('right')
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
             for _ in range(5):
-                self._arm_inc('up', 'right'); time.sleep(D)
+                if self._gesture_cancel.is_set(): return
+                self._arm_inc('up', 'right'); self._sleep_cancelable(D)
             self._set_head(0.0, 0.5)
             self._arm_to_side('left')
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
             for _ in range(5):
-                self._arm_inc('up', 'left'); time.sleep(D)
+                if self._gesture_cancel.is_set(): return
+                self._arm_inc('up', 'left'); self._sleep_cancelable(D)
         for _ in range(4):
-            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); time.sleep(D)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); self._sleep_cancelable(D)
         self._set_head(-0.2, 0.0)
-        time.sleep(1.5)
+        self._sleep_cancelable(1.5)
+        if self._gesture_cancel.is_set(): return
         self._set_head(0.0, 0.0)
         self._arm_to_side('right'); self._arm_to_side('left')
 
     def _dance_macarena(self):
         D = 0.25
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.5)
+        self._arm_to_side('right'); self._arm_to_side('left'); self._sleep_cancelable(0.5)
         for _ in range(5):
-            self._arm_inc('forward', 'right'); self._arm_inc('forward', 'left'); time.sleep(D)
-        time.sleep(0.3)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('forward', 'right'); self._arm_inc('forward', 'left'); self._sleep_cancelable(D)
+        self._sleep_cancelable(0.3)
         for _ in range(5):
-            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); time.sleep(D)
-        time.sleep(0.3)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); self._sleep_cancelable(D)
+        self._sleep_cancelable(0.3)
         for _ in range(4):
+            if self._gesture_cancel.is_set(): return
             self._arm_inc('in', 'right'); self._arm_inc('in', 'left')
-            self._arm_inc('down', 'right'); self._arm_inc('down', 'left'); time.sleep(D)
-        time.sleep(0.3)
+            self._arm_inc('down', 'right'); self._arm_inc('down', 'left'); self._sleep_cancelable(D)
+        self._sleep_cancelable(0.3)
+        if self._gesture_cancel.is_set(): return
         with self.lock:
             self.client.Move(0, 0, 0.5)
-        time.sleep(1.0)
+        self._sleep_cancelable(1.0)
         with self.lock:
             self.client.Move(0, 0, 0)
         self._arm_to_side('right'); self._arm_to_side('left')
 
     def _dance_twist(self):
         D = 0.2
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.5)
+        self._arm_to_side('right'); self._arm_to_side('left'); self._sleep_cancelable(0.5)
         for _ in range(5):
-            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); time.sleep(D)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); self._sleep_cancelable(D)
         for _ in range(3):
+            if self._gesture_cancel.is_set(): return
             with self.lock: self.client.Move(0, 0, 0.4)
-            self._set_head(0.0, 0.4); time.sleep(0.6)
+            self._set_head(0.0, 0.4); self._sleep_cancelable(0.6)
             with self.lock: self.client.Move(0, 0, -0.4)
-            self._set_head(0.0, -0.4); time.sleep(0.6)
+            self._set_head(0.0, -0.4); self._sleep_cancelable(0.6)
         with self.lock: self.client.Move(0, 0, 0)
-        self._set_head(0.0, 0.0); time.sleep(0.3)
+        self._set_head(0.0, 0.0); self._sleep_cancelable(0.3)
         self._arm_to_side('right'); self._arm_to_side('left')
 
     def _dance_bow(self):
-        self._set_head(0.8, 0.0); time.sleep(2.0); self._set_head(0.0, 0.0)
+        self._set_head(0.8, 0.0); self._sleep_cancelable(2.0)
+        if self._gesture_cancel.is_set(): return
+        self._set_head(0.0, 0.0)
 
     def _dance_chicken(self):
         D = 0.15
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.5)
+        self._arm_to_side('right'); self._arm_to_side('left'); self._sleep_cancelable(0.5)
         for _ in range(5):
+            if self._gesture_cancel.is_set(): return
             for _ in range(3):
-                self._arm_inc('out', 'right'); self._arm_inc('out', 'left'); time.sleep(D)
+                self._arm_inc('out', 'right'); self._arm_inc('out', 'left'); self._sleep_cancelable(D)
             self._set_head(0.3, 0.0)
             for _ in range(3):
-                self._arm_inc('in', 'right'); self._arm_inc('in', 'left'); time.sleep(D)
+                self._arm_inc('in', 'right'); self._arm_inc('in', 'left'); self._sleep_cancelable(D)
             self._set_head(-0.1, 0.0)
-        self._set_head(0.0, 0.0); time.sleep(0.3)
+        self._set_head(0.0, 0.0); self._sleep_cancelable(0.3)
         self._arm_to_side('right'); self._arm_to_side('left')
 
     def _dance_disco(self):
         D = 0.2
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.5)
+        self._arm_to_side('right'); self._arm_to_side('left'); self._sleep_cancelable(0.5)
         for _ in range(3):
+            if self._gesture_cancel.is_set(): return
             for _ in range(6):
-                self._arm_inc('up', 'right'); self._arm_inc('out', 'right'); time.sleep(D)
+                self._arm_inc('up', 'right'); self._arm_inc('out', 'right'); self._sleep_cancelable(D)
             self._set_head(-0.2, -0.3)
             with self.lock: self.client.Move(0, -0.2, 0)
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
             self._arm_to_side('right')
             for _ in range(6):
-                self._arm_inc('up', 'left'); self._arm_inc('out', 'left'); time.sleep(D)
+                if self._gesture_cancel.is_set(): return
+                self._arm_inc('up', 'left'); self._arm_inc('out', 'left'); self._sleep_cancelable(D)
             self._set_head(-0.2, 0.3)
             with self.lock: self.client.Move(0, 0.2, 0)
-            time.sleep(0.5)
+            self._sleep_cancelable(0.5)
             self._arm_to_side('left')
         with self.lock: self.client.Move(0, 0, 0)
         self._set_head(0.0, 0.0)
 
     def _dab(self):
         D = 0.25
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.6)
-        for _ in range(5): self._arm_inc('back', 'right'); time.sleep(D)
-        for _ in range(5): self._arm_inc('in', 'right'); time.sleep(D)
-        for _ in range(6): self._arm_inc('up', 'right'); time.sleep(D)
-        for _ in range(7): self._arm_inc('up', 'left'); time.sleep(D)
-        for _ in range(4): self._arm_inc('out', 'left'); time.sleep(D)
-        self._set_head(0.5, 0.5); time.sleep(2.5)
-        self._set_head(0.0, 0.0); time.sleep(0.3)
+        self._arm_to_side('right'); self._arm_to_side('left')
+        self._sleep_cancelable(0.6)
+        for _ in range(5):
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('back', 'right'); self._sleep_cancelable(D)
+        for _ in range(5):
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('in', 'right'); self._sleep_cancelable(D)
+        for _ in range(6):
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'right'); self._sleep_cancelable(D)
+        for _ in range(7):
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'left'); self._sleep_cancelable(D)
+        for _ in range(4):
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('out', 'left'); self._sleep_cancelable(D)
+        self._set_head(0.5, 0.5); self._sleep_cancelable(2.5)
+        if self._gesture_cancel.is_set(): return
+        self._set_head(0.0, 0.0); self._sleep_cancelable(0.3)
         self._arm_to_side('right'); self._arm_to_side('left')
 
     def _flex(self):
         D = 0.25
-        self._arm_to_side('right'); self._arm_to_side('left'); time.sleep(0.6)
+        self._arm_to_side('right'); self._arm_to_side('left')
+        self._sleep_cancelable(0.6)
         for _ in range(7):
-            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); time.sleep(D)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('up', 'right'); self._arm_inc('up', 'left'); self._sleep_cancelable(D)
         for _ in range(3):
-            self._arm_inc('out', 'right'); self._arm_inc('out', 'left'); time.sleep(D)
-        self._set_head(-0.3, 0.0); time.sleep(2.0)
-        self._set_head(0.0, 0.0); time.sleep(0.3)
+            if self._gesture_cancel.is_set(): return
+            self._arm_inc('out', 'right'); self._arm_inc('out', 'left'); self._sleep_cancelable(D)
+        self._set_head(-0.3, 0.0); self._sleep_cancelable(2.0)
+        if self._gesture_cancel.is_set(): return
+        self._set_head(0.0, 0.0); self._sleep_cancelable(0.3)
         self._arm_to_side('right'); self._arm_to_side('left')
 
 

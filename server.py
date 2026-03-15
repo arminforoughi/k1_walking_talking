@@ -76,6 +76,7 @@ _NAME_PATTERNS = [
 
 _CMD_PATTERNS = [
     (re.compile(r"\b(?:i'll |i will |let me |okay,? |ok,? )?(?:follow|following)\b(?:\s+(?:you|him|her|them|that person|(\w+)))?", re.IGNORECASE), "follow"),
+    (re.compile(r"\b(?:stop\s+(?:the\s+)?gesture)\b", re.IGNORECASE), "stop_gesture"),
     (re.compile(r"\b(?:i'll |i will |let me )?stop(?:ping)?\b(?:\s+(?:follow|track|mov))?", re.IGNORECASE), "stop"),
     (re.compile(r"\b(?:i'll |let me |okay,? )?(?:go(?:ing)?|walk(?:ing)?|head(?:ing)?|mov(?:e|ing))\s+(?:to(?:ward)?|over to)\s+(?:(\d+(?:\.\d+)?)\s*(?:m(?:eters?)?|ft|feet)\s+(?:from|away from|near|of)\s+)?(?:the\s+|that\s+)?(\w+)", re.IGNORECASE), "go_to"),
     (re.compile(r"\b(?:i'll |i will |let me |here'?s? |okay,? |ok,? )?(?:do |doing |start )?(?:a |the )?(?:dance|dancing)\b(?:\s+(?:the\s+)?(\w+))?", re.IGNORECASE), "dance"),
@@ -695,6 +696,10 @@ class RobotController:
     def do_visual_kick(self, start=True):
         self._send({'cmd': 'visual_kick', 'start': start})
 
+    def do_stop_gesture(self):
+        """Stop any ongoing gesture and reset arms/head on the robot."""
+        self._send({'cmd': 'stop_gesture'})
+
     # ── Tracking ─────────────────────────────────────────────────────────
 
     def start_tracking(self, target=None):
@@ -1162,6 +1167,7 @@ class RobotController:
         self.stop_tracking()
         self.stop_movement()
         self.rotate_head(0.0, 0.0)
+        self.do_stop_gesture()
         print("[Robot] All stopped")
 
     def shutdown(self):
@@ -1212,6 +1218,7 @@ class CommandDispatcher:
 
         actions = {
             "follow": lambda: self.robot.start_follow(target),
+            "stop_gesture": self.robot.do_stop_gesture,
             "stop": self.robot.stop_all,
             "dance": lambda: self.robot.do_dance(target),
             "wave": self.robot.do_wave,
@@ -1381,6 +1388,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-follow" onclick="goToPrompt()">Go To...</button>
         <button class="ctrl-btn btn-stop" onclick="cmd('stop')">STOP ALL</button>
         <button class="ctrl-btn btn-action" onclick="cmd('get_up')">Get Up</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('stop_gesture')">Stop Gesture</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-dance" onclick="cmd('dance')">Dance</button>
@@ -2071,6 +2079,8 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.nod()
         elif action == 'head_shake':
             robot.head_shake()
+        elif action == 'stop_gesture':
+            robot.do_stop_gesture()
         elif action == 'look_up':
             robot.rotate_head(-0.3, 0.0)
         elif action == 'look_down':
