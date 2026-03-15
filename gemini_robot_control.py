@@ -719,15 +719,18 @@ class RobotController:
     # ── Soccer moves ───────────────────────────────────────────────────────
 
     def do_shoot(self):
-        """Powerful soccer kick (API 2024)."""
+        """Powerful soccer kick. Uses whole-body kick (dance_id 5)."""
         def _do():
             try:
                 from booster_robotics_sdk_python import B1LocoApiId
                 with self.lock:
-                    self.client.SendApiRequest(B1LocoApiId(2024), "")
+                    self.client.SendApiRequest(
+                        B1LocoApiId(2029),
+                        json.dumps({'dance_id': 5})  # boxing kick - whole-body kick
+                    )
             except (ImportError, AttributeError):
                 with self.lock:
-                    self.client.SendApiRequest(2024, "")
+                    self.client.SendApiRequest(2029, json.dumps({'dance_id': 5}))
         threading.Thread(target=_do, daemon=True).start()
 
     def do_visual_kick(self, start=True):
@@ -751,7 +754,7 @@ class RobotController:
         """Shoot then celebrate."""
         def _do():
             self.do_shoot()
-            time.sleep(2.0)
+            time.sleep(2.5)
             self.do_dance("celebrate")
         threading.Thread(target=_do, daemon=True).start()
 

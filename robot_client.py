@@ -242,15 +242,19 @@ class RobotExecutor:
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_shoot(self, _):
-        """Powerful kicking motion (soccer shoot)."""
+        """Powerful kicking motion (soccer shoot). Uses whole-body kick (dance_id 5)."""
         def _do():
+            self._cancel_gesture_and_reset()
             try:
                 from booster_robotics_sdk_python import B1LocoApiId
                 with self.lock:
-                    self.client.SendApiRequest(B1LocoApiId(2024), "")
+                    self.client.SendApiRequest(
+                        B1LocoApiId(2029),  # kWholeBodyDance
+                        json.dumps({'dance_id': 5})  # boxing kick - whole-body kick motion
+                    )
             except (ImportError, AttributeError):
                 with self.lock:
-                    self.client.SendApiRequest(2024, "")
+                    self.client.SendApiRequest(2029, json.dumps({'dance_id': 5}))
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_visual_kick(self, m):
@@ -275,8 +279,11 @@ class RobotExecutor:
             try:
                 from booster_robotics_sdk_python import B1LocoApiId
                 with self.lock:
-                    self.client.SendApiRequest(B1LocoApiId(2024), "")
-                time.sleep(2.0)  # let shoot complete
+                    self.client.SendApiRequest(
+                        B1LocoApiId(2029),
+                        json.dumps({'dance_id': 5})  # whole-body kick
+                    )
+                time.sleep(2.5)  # let kick complete
                 if self._gesture_cancel.is_set():
                     return
                 with self.lock:
@@ -286,7 +293,12 @@ class RobotExecutor:
                     )
             except (ImportError, AttributeError):
                 with self.lock:
-                    self.client.SendApiRequest(2024, "")
+                    self.client.SendApiRequest(2029, json.dumps({'dance_id': 5}))
+                time.sleep(2.5)
+                if self._gesture_cancel.is_set():
+                    return
+                with self.lock:
+                    self.client.SendApiRequest(2030, json.dumps({'dance_id': 6}))
         threading.Thread(target=_do, daemon=True).start()
 
     # ── Arm commands (for server-driven choreography if needed)
