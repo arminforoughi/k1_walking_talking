@@ -120,8 +120,11 @@ _CMD_PATTERNS = [
     (re.compile(r"\b(?:nod(?:ding)?)\b", re.IGNORECASE), "nod"),
     (re.compile(r"\b(?:shak(?:e|ing)\s+(?:my\s+)?head)\b", re.IGNORECASE), "head_shake"),
     (re.compile(r"\b(?:get\s+up|stand\s+up|get\s+back\s+up)\b", re.IGNORECASE), "get_up"),
-    (re.compile(r"\b(?:shoot|kick\s+the\s+ball|power\s+kick)\b", re.IGNORECASE), "shoot"),
-    (re.compile(r"\b(?:side\s*foot\s*kick|visual\s*kick|pass\s+the\s+ball)\b", re.IGNORECASE), "visual_kick"),
+    (re.compile(r"\b(?:shoot|kick\s+the\s+ball|power\s+kick|score|goal!?)\b", re.IGNORECASE), "shoot"),
+    (re.compile(r"\b(?:side\s*foot\s*kick|visual\s*kick|pass\s+the\s+ball|pass)\b", re.IGNORECASE), "visual_kick"),
+    (re.compile(r"\b(?:stop\s+(?:the\s+)?kick|stop\s+kick)\b", re.IGNORECASE), "stop_visual_kick"),
+    (re.compile(r"\b(?:soccer\s+combo|shoot\s+and\s+celebrate|score\s+and\s+celebrate)\b", re.IGNORECASE), "soccer_combo"),
+    (re.compile(r"\b(?:celebrate|celebration|we\s+scored)\b", re.IGNORECASE), "dance_celebrate"),
 ]
 
 
@@ -696,6 +699,12 @@ class RobotController:
     def do_visual_kick(self, start=True):
         self._send({'cmd': 'visual_kick', 'start': start})
 
+    def do_stop_visual_kick(self):
+        self._send({'cmd': 'visual_kick', 'start': False})
+
+    def do_soccer_combo(self):
+        self._send({'cmd': 'soccer_combo'})
+
     def do_stop_gesture(self):
         """Stop any ongoing gesture and reset arms/head on the robot."""
         self._send({'cmd': 'stop_gesture'})
@@ -1245,6 +1254,8 @@ class CommandDispatcher:
             "get_up": self.robot.do_get_up,
             "shoot": self.robot.do_shoot,
             "visual_kick": lambda: self.robot.do_visual_kick(True),
+            "stop_visual_kick": self.robot.do_stop_visual_kick,
+            "soccer_combo": self.robot.do_soccer_combo,
         }
 
         if cmd in actions:
@@ -1425,6 +1436,11 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="btn-row">
         <button class="ctrl-btn btn-soccer" onclick="cmd('shoot')">Shoot</button>
         <button class="ctrl-btn btn-soccer" onclick="cmd('visual_kick')">Side Foot Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('stop_visual_kick')">Stop Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('soccer_combo')">Shoot + Celebrate</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_kick')">Boxing Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_roundhouse')">Roundhouse</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_celebrate')">Celebrate</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-head" onclick="cmd('look_up')">Look Up</button>
@@ -2075,6 +2091,10 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.do_shoot()
         elif action == 'visual_kick':
             robot.do_visual_kick(start=body.get('start', True) if isinstance(body, dict) else True)
+        elif action == 'stop_visual_kick':
+            robot.do_stop_visual_kick()
+        elif action == 'soccer_combo':
+            robot.do_soccer_combo()
         elif action == 'nod':
             robot.nod()
         elif action == 'head_shake':
@@ -2156,6 +2176,14 @@ DANCES & GESTURES:
 - "Moonwalk!" / "Michael Jackson dance!" / "Kick!" / "Roundhouse!" / "Salsa!" etc.
 - "I'll wave" / "Let me shake hands" / "Dabbing!" / "Flexing!"
 - "Nodding" / "Shaking my head"
+
+SOCCER MOVES:
+- "Shoot!" / "Kick the ball!" / "Score!" / "Goal!" — powerful soccer kick
+- "Pass!" / "Side foot kick!" / "Pass the ball!" — side-foot pass
+- "Stop kick" — stops the side-foot kick if it's running
+- "Shoot and celebrate!" / "Soccer combo!" — shoot then celebration dance
+- "Celebrate!" / "We scored!" — celebration dance
+- "Boxing kick!" / "Roundhouse!" — whole-body kick moves
 
 IMPORTANT RULES:
 - When someone says "follow me", respond with "I'll follow you!"

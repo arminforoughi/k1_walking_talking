@@ -125,6 +125,11 @@ _CMD_PATTERNS = [
     (re.compile(r"\b(?:chicken\s*dance|do(?:ing)?\s+(?:the\s+)?chicken)\b", re.IGNORECASE), "dance_chicken"),
     (re.compile(r"\b(?:disco)\b", re.IGNORECASE), "dance_disco"),
     (re.compile(r"\b(?:karate|kung\s*fu)\b", re.IGNORECASE), "dance_karate"),
+    # Soccer moves
+    (re.compile(r"\b(?:shoot|kick\s+the\s+ball|power\s+kick|score|goal!?)\b", re.IGNORECASE), "shoot"),
+    (re.compile(r"\b(?:side\s*foot\s*kick|visual\s*kick|pass\s+the\s+ball|pass)\b", re.IGNORECASE), "visual_kick"),
+    (re.compile(r"\b(?:stop\s+(?:the\s+)?kick|stop\s+kick)\b", re.IGNORECASE), "stop_visual_kick"),
+    (re.compile(r"\b(?:soccer\s+combo|shoot\s+and\s+celebrate|score\s+and\s+celebrate)\b", re.IGNORECASE), "soccer_combo"),
     # Nod / shake head
     (re.compile(r"\b(?:nod(?:ding)?)\b", re.IGNORECASE), "nod"),
     (re.compile(r"\b(?:shak(?:e|ing)\s+(?:my\s+)?head)\b", re.IGNORECASE), "head_shake"),
@@ -710,6 +715,45 @@ class RobotController:
             self._arm_to_side("right")
             self._arm_to_side("left")
         threading.Thread(target=_flex, daemon=True).start()
+
+    # ── Soccer moves ───────────────────────────────────────────────────────
+
+    def do_shoot(self):
+        """Powerful soccer kick (API 2024)."""
+        def _do():
+            try:
+                from booster_robotics_sdk_python import B1LocoApiId
+                with self.lock:
+                    self.client.SendApiRequest(B1LocoApiId(2024), "")
+            except (ImportError, AttributeError):
+                with self.lock:
+                    self.client.SendApiRequest(2024, "")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def do_visual_kick(self, start=True):
+        """Side-foot kick / pass. start=True to kick, start=False to stop."""
+        def _do():
+            import json
+            param = json.dumps({"start": start})
+            try:
+                from booster_robotics_sdk_python import B1LocoApiId
+                with self.lock:
+                    self.client.SendApiRequest(B1LocoApiId(2038), param)
+            except (ImportError, AttributeError):
+                with self.lock:
+                    self.client.SendApiRequest(2038, param)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def do_stop_visual_kick(self):
+        self.do_visual_kick(start=False)
+
+    def do_soccer_combo(self):
+        """Shoot then celebrate."""
+        def _do():
+            self.do_shoot()
+            time.sleep(2.0)
+            self.do_dance("celebrate")
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Named Dances & Moves ─────────────────────────────────────────────
 
@@ -1366,6 +1410,14 @@ class CommandDispatcher:
             self.robot.nod()
         elif cmd == "head_shake":
             self.robot.head_shake()
+        elif cmd == "shoot":
+            self.robot.do_shoot()
+        elif cmd == "visual_kick":
+            self.robot.do_visual_kick(True)
+        elif cmd == "stop_visual_kick":
+            self.robot.do_stop_visual_kick()
+        elif cmd == "soccer_combo":
+            self.robot.do_soccer_combo()
 
 
 # ── Camera + Detection Node ─────────────────────────────────────────────────
@@ -1711,6 +1763,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .ctrl-btn:active { transform:scale(0.95); }
   .btn-follow { background:#4CAF50; color:#000; }
   .btn-dance { background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; }
+  .btn-soccer { background:linear-gradient(135deg,#2e7d32,#1b5e20); color:#fff; }
   .btn-action { background:#2196F3; color:#fff; }
   .btn-head { background:#43e97b; color:#000; }
   .btn-stop { background:#f44336; color:#fff; }
@@ -1791,6 +1844,15 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-action" onclick="cmd('flex')">Flex</button>
         <button class="ctrl-btn btn-action" onclick="cmd('nod')">Nod</button>
         <button class="ctrl-btn btn-action" onclick="cmd('head_shake')">Shake Head</button>
+      </div>
+      <div class="btn-row">
+        <button class="ctrl-btn btn-soccer" onclick="cmd('shoot')">Shoot</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('visual_kick')">Side Foot Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('stop_visual_kick')">Stop Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('soccer_combo')">Shoot + Celebrate</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_kick')">Boxing Kick</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_roundhouse')">Roundhouse</button>
+        <button class="ctrl-btn btn-soccer" onclick="cmd('dance_celebrate')">Celebrate</button>
       </div>
       <div class="btn-row">
         <button class="ctrl-btn btn-head" onclick="cmd('look_up')">Look Up</button>
@@ -2117,6 +2179,18 @@ class WebHandler(BaseHTTPRequestHandler):
         elif action == 'flex':
             robot.do_flex()
             return {'status': 'ok', 'action': 'flex'}
+        elif action == 'shoot':
+            robot.do_shoot()
+            return {'status': 'ok', 'action': 'shoot'}
+        elif action == 'visual_kick':
+            robot.do_visual_kick(start=body.get('start', True) if isinstance(body, dict) else True)
+            return {'status': 'ok', 'action': 'visual_kick'}
+        elif action == 'stop_visual_kick':
+            robot.do_stop_visual_kick()
+            return {'status': 'ok', 'action': 'stop_visual_kick'}
+        elif action == 'soccer_combo':
+            robot.do_soccer_combo()
+            return {'status': 'ok', 'action': 'soccer_combo'}
         elif action == 'nod':
             robot.nod()
             return {'status': 'ok', 'action': 'nod'}

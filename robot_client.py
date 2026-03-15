@@ -268,6 +268,27 @@ class RobotExecutor:
                     self.client.SendApiRequest(2038, param)
         threading.Thread(target=_do, daemon=True).start()
 
+    def _cmd_soccer_combo(self, _):
+        """Shoot (power kick) then celebrate."""
+        def _do():
+            self._cancel_gesture_and_reset()
+            try:
+                from booster_robotics_sdk_python import B1LocoApiId
+                with self.lock:
+                    self.client.SendApiRequest(B1LocoApiId(2024), "")
+                time.sleep(2.0)  # let shoot complete
+                if self._gesture_cancel.is_set():
+                    return
+                with self.lock:
+                    self.client.SendApiRequest(
+                        B1LocoApiId.kDance,
+                        json.dumps({'dance_id': 6})  # celebrate/cheer
+                    )
+            except (ImportError, AttributeError):
+                with self.lock:
+                    self.client.SendApiRequest(2024, "")
+        threading.Thread(target=_do, daemon=True).start()
+
     # ── Arm commands (for server-driven choreography if needed)
 
     def _cmd_arm_to_side(self, m):
